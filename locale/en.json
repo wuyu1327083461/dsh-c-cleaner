@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "C-Drive Escape Cleaner",
+    "description": "Keeps AI toolchain cache and temp writes off the C: drive: redirects TEMP/pip/uv/HuggingFace/Torch/npm/Playwright cache variables to an escape root on another drive, watches the C: directories toolchains leak into, classifies every candidate as safe-to-delete / cache / locked, and cleans only what is provably safe — recycle bin by default."
+  }
+}

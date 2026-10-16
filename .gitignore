@@ -1,0 +1,14 @@
+# Runtime state (the plugin writes its SQLite DB next to itself when installed)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs & temp
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+npm-debug.log*
