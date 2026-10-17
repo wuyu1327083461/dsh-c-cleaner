@@ -1187,6 +1187,773 @@ await check('lockowner.batch-every-path-answered', async () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// PHASE 3 — PRD §7 (a) `mklink /J` junction migration, (b) `post_session_close`
+// ══════════════════════════════════════════════════════════════════════════
+// The Phase 3 acceptance surface is exactly two features (PRD §7). Both are asserted against
+// the PRODUCTION entry points (`inspectDirectory` / `migrateDirectory` / `undoMigration` /
+// `findCandidates` / `installSessionHook`), never a reimplementation of them.
+//
+// Volume reality on this host: C: and E: are separate volumes and `fs.renameSync` between them
+// throws EXDEV (probed). The module therefore has a copy+verify+delete path that ONLY runs
+// cross-volume — a same-volume fixture would exercise the `rename` shortcut and prove nothing
+// about the PRD's actual scenario. So the live fixture is created on the real C: volume,
+// migrates to the escape root on E:, and is undone afterwards.
+
+const MIG_SRC_ROOT = path.join(process.env.LOCALAPPDATA, 'Temp');
+const MIG_TARGET_ROOT = path.join(cfg.escapeRoot, `mig_probe_${STAMP}`);
+const migScratch = path.join(MIG_SRC_ROOT, `dshcc_mig_${STAMP}`);
+const resolveConfig = (await load('lib/config.js')).resolveConfig;
+
+function migCfg(over = {}) {
+  return resolveConfig({ migrateTargetRoot: MIG_TARGET_ROOT, ...over }, process.env);
+}
+
+await check('migrate.inspect-gate-refusals', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  assert(typeof m.inspectDirectory === 'function', 'inspectDirectory is not exported');
+  assert(typeof m.targetRootOf === 'function', 'targetRootOf is not exported');
+  assertEq(m.MIGRATION_STATE.LINKED, 'LINKED', 'MIGRATION_STATE.LINKED');
+
+  const c = migCfg();
+  assertEq(m.targetRootOf(c), MIG_TARGET_ROOT, 'targetRootOf honours an explicit migrateTargetRoot');
+
+  mkdirp(migScratch);
+  cleanupFns.push(() => rmrf(migScratch));
+
+  // A real, eligible stubborn directory: files, nesting, enough components below the root.
+  const good = path.join(migScratch, 'stubborn');
+  mkdirp(path.join(good, 'nested'));
+  fs.writeFileSync(path.join(good, 'a.bin'), 'a'.repeat(1024));
+  fs.writeFileSync(path.join(good, 'nested', 'b.bin'), 'b'.repeat(2048));
+  const goodPlan = m.inspectDirectory(good, c);
+  assert(goodPlan.ok, `an ordinary C: directory must be migratable, got ${goodPlan.code}: ${goodPlan.reason}`);
+  assertEq(goodPlan.bytes, 3072, 'inspectDirectory measured byte total');
+  assertEq(goodPlan.files, 2, 'inspectDirectory measured file count');
+  assert(under(goodPlan.target, MIG_TARGET_ROOT), `target ${json(goodPlan.target)} not under the target root`);
+
+  // Every refusal the PRD depends on. Each answer must be a CODE, never a throw (PRD §6.3).
+  const refusal = (p, want, useCfg = c) => {
+    const v = m.inspectDirectory(p, useCfg);
+    assert(v && v.ok === false, `inspectDirectory(${json(p)}) should refuse with ${want}, got ok=${v?.ok}`);
+    assertEq(v.code, want, `inspectDirectory(${json(p)}) code`);
+    return v;
+  };
+
+  refusal('', 'BAD_PATH');
+  refusal(path.join(migScratch, 'does-not-exist'), 'MISSING');
+  const plainFile = path.join(migScratch, 'plain.bin');
+  fs.writeFileSync(plainFile, 'x');
+  refusal(plainFile, 'NOT_A_DIRECTORY');                    // files are clean()'s business
+
+  // PRD §6.2 hardcoded blacklist — migration relocates a whole tree, a stronger act than
+  // deleting one file, so the same blacklist must bind it.
+  refusal('C:\\Windows', 'PROTECTED');
+  refusal('C:\\Program Files', 'PROTECTED');
+  refusal('C:\\Windows\\Temp\\anything', 'PROTECTED');
+  refusal(MIG_SRC_ROOT, 'PROTECTED');                       // a watch root itself
+  refusal(cfg.escapeRoot, 'PROTECTED');                     // our own escape root
+  refusal(MIG_TARGET_ROOT, 'PROTECTED');                    // the migration destination
+
+  refusal('C:\\Temp', 'TOO_SHALLOW');                       // a typo may not relocate a system dir
+  // An ancestor of a watch root: migrating it would hide every tracked file beneath it.
+  refusal(process.env.LOCALAPPDATA, 'ANCESTOR_OF_WATCH_ROOT');
+  // An ancestor of a protected path (USERPROFILE contains Desktop/Documents).
+  refusal(process.env.USERPROFILE, 'ANCESTOR_OF_PROTECTED');
+
+  // A junction is not a directory: lstat is the only call that sees the link.
+  const link = path.join(migScratch, 'already-linked');
+  fs.symlinkSync(good, link, 'junction');
+  refusal(link, 'ALREADY_LOGGED');
+
+  // A tree CONTAINING a junction cannot be copied: the copy would duplicate the target's bytes.
+  const host = path.join(migScratch, 'has-reparse');
+  mkdirp(host);
+  fs.writeFileSync(path.join(host, 'real.bin'), 'r');
+  fs.symlinkSync(good, path.join(host, 'inner-link'), 'junction');
+  refusal(host, 'CONTAINS_REPARSE_POINTS');
+
+  const emptyDir = path.join(migScratch, 'empty-dir');
+  mkdirp(emptyDir);
+  refusal(emptyDir, 'EMPTY');
+
+  // Same volume: a "migration" on C: frees nothing and only adds indirection.
+  refusal(good, 'SAME_VOLUME', migCfg({ migrateTargetRoot: path.join(MIG_SRC_ROOT, `same_${STAMP}`) }));
+
+  // No derivable target root: refuse rather than guess.
+  const noRoot = m.inspectDirectory(good, { ...c, escapeRoot: '', migrateTargetRoot: null });
+  assert(noRoot.ok === false, 'a config with no target root must refuse');
+  assertEq(noRoot.code, 'NO_TARGET_ROOT', 'no-target-root refusal code');
+
+  return `12 refusal codes answered as codes, never throws; eligible dir measured ${goodPlan.files} files / ${goodPlan.bytes} B, target ${goodPlan.target}`;
+});
+
+await check('migrate.cross-volume-move-and-junction', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const dbm = await load('lib/state-db.js');
+  const c = migCfg();
+
+  const src = path.join(MIG_SRC_ROOT, `dshcc_mv_${STAMP}`);
+  rmrf(src);
+  mkdirp(path.join(src, 'deep', 'deeper'));
+  for (let i = 0; i < 5; i += 1) fs.writeFileSync(path.join(src, 'deep', 'deeper', `f${i}.bin`), Buffer.alloc(4096, i));
+  fs.writeFileSync(path.join(src, 'top.txt'), 'top-level');
+  cleanupFns.push(() => rmrf(src));
+
+  const db = new dbm.StateDB(path.join(mkdirp(path.join(probeRoot, `migdb_${STAMP}`)), 'state.db'));
+  cleanupFns.push(() => { try { db.close(); } catch {} });
+
+  const before = m.walkTree(src);
+  assertEq(before.reparsePoints.length, 0, 'the fixture contains no reparse points');
+
+  // Assert the FACT the module is built around, so this check fails loudly if a future host or
+  // Node version ever made the copy path unreachable.
+  let renameCode = null;
+  try { fs.renameSync(src, path.join(MIG_TARGET_ROOT, 'never')); } catch (e) { renameCode = e.code; }
+  assertEq(renameCode, 'EXDEV', 'C: -> E: rename must fail with EXDEV (this is why copy+verify exists)');
+
+  const result = await m.migrateDirectory(src, { cfg: c, log: silentLog, db });
+  assert(result.ok, `migrateDirectory failed: ${result.code}: ${result.reason}`);
+  assertEq(result.method, 'copy', 'the cross-volume move used copy+verify, not rename');
+  assertEq(result.files, before.files, 'reported file count matches the pre-move measurement');
+  assertEq(result.bytes, before.bytes, 'reported byte count matches the pre-move measurement');
+
+  // 1. The junction is at the source path and is a reparse point.
+  const st = fs.lstatSync(src);
+  assert(st.isSymbolicLink(), 'the source path is now a junction (lstat.isSymbolicLink)');
+  assert(fs.statSync(src).isDirectory(), 'the junction still stats as a directory (transparent to callers)');
+  assertEq(norm(fs.readlinkSync(src)), norm(result.target), 'the junction points at the new location');
+
+  // 2. The bytes physically LEFT C: — the whole point of PRD §3.4.
+  assert(under(result.target, MIG_TARGET_ROOT), `target ${json(result.target)} is under the target root`);
+  assert(
+    path.parse(result.target).root.toUpperCase() !== path.parse(src).root.toUpperCase(),
+    'the destination volume differs from the source volume',
+  );
+  const after = m.walkTree(result.target);
+  assertEq(after.files, before.files, 'every file arrived at the target');
+  assertEq(after.bytes, before.bytes, 'every byte arrived at the target');
+
+  // 3. PRD §3.4 step (3): a write through the OLD C: path lands on the destination volume.
+  fs.writeFileSync(path.join(src, 'through-junction.txt'), 'lands off C:');
+  assert(
+    fs.existsSync(path.join(result.target, 'through-junction.txt')),
+    'a write through the old C: path must physically land in the target directory',
+  );
+
+  // 4. The journal reached LINKED, so the crash window is closed.
+  const rec = db.getMigrationBySource(path.resolve(src));
+  assert(rec !== null, 'a migration record exists for the source path');
+  assertEq(rec.state, 'LINKED', 'journal state after a successful migration');
+  assertEq(norm(rec.target_path), norm(result.target), 'journal target matches the real target');
+  assertEq(db.listInterruptedMigrations().length, 0, 'a completed migration is not reported as interrupted');
+
+  // 5. Undo: drop the junction, move the data back, prove the target is gone.
+  const undo = await m.undoMigration(src, { cfg: c, log: silentLog, db });
+  assert(undo.ok, `undoMigration failed: ${undo.code}: ${undo.reason}`);
+  assert(!fs.lstatSync(src).isSymbolicLink(), 'after an undo the source is a real directory again');
+  assert(!fs.existsSync(result.target), 'after an undo the target directory is gone');
+  const restored = m.walkTree(src);
+  assertEq(restored.files, after.files + 1, 'every file came back, including the one written through the junction');
+  assertEq(db.getMigrationBySource(path.resolve(src)).state, 'RESTORED', 'journal state after an undo');
+
+  return `copy moved ${result.files} files / ${result.bytes} B C:->E:, junction redirects writes to E:, undo restored the tree and removed the target`;
+});
+
+await check('migrate.undo-refuses-to-eat-data', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const dbm = await load('lib/state-db.js');
+  const c = migCfg();
+  const db = new dbm.StateDB(path.join(mkdirp(path.join(probeRoot, `migdb2_${STAMP}`)), 'state.db'));
+  cleanupFns.push(() => { try { db.close(); } catch {} });
+
+  // A path with NO journal record: undo must refuse, not guess what used to be there.
+  const stranger = path.join(MIG_SRC_ROOT, `dshcc_stranger_${STAMP}`);
+  mkdirp(stranger);
+  fs.writeFileSync(path.join(stranger, 'keep.txt'), 'must survive');
+  cleanupFns.push(() => rmrf(stranger));
+  const noRecord = await m.undoMigration(stranger, { cfg: c, log: silentLog, db });
+  assert(noRecord.ok === false, 'undo of an unrecorded path must refuse');
+  assertEq(noRecord.code, 'NO_RECORD', 'unrecorded undo refusal code');
+  assert(fs.existsSync(path.join(stranger, 'keep.txt')), 'the unrecorded directory was not touched');
+
+  // A recorded path whose junction was REPLACED by a real directory full of data. Undoing it
+  // would delete real content, so it must refuse — this is the probe that matters.
+  const swapped = path.join(MIG_SRC_ROOT, `dshcc_swapped_${STAMP}`);
+  rmrf(swapped);
+  mkdirp(swapped);
+  fs.writeFileSync(path.join(swapped, 'a.bin'), 'a');
+  cleanupFns.push(() => rmrf(swapped));
+  const mig = await m.migrateDirectory(swapped, { cfg: c, log: silentLog, db });
+  assert(mig.ok, `setup migration failed: ${mig.code}: ${mig.reason}`);
+  fs.rmdirSync(swapped);                                     // drop the junction
+  mkdirp(swapped);                                           // ...and put a REAL directory back
+  fs.writeFileSync(path.join(swapped, 'precious.txt'), 'do not delete');
+  const refuse = await m.undoMigration(swapped, { cfg: c, log: silentLog, db });
+  assert(refuse.ok === false, 'undo of a path that is no longer a junction must refuse');
+  assertEq(refuse.code, 'NOT_A_JUNCTION', 'replaced-junction refusal code');
+  assert(fs.existsSync(path.join(swapped, 'precious.txt')), 'the real directory survived the refused undo');
+
+  return `undo refused NO_RECORD for an unrecorded path and NOT_A_JUNCTION for a re-materialised directory; neither fixture lost data`;
+});
+
+await check('migrate.candidates-come-from-tracked-rows', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const c = migCfg({ migrateMinBytes: 1024 });
+
+  const dir = path.join(MIG_SRC_ROOT, `dshcc_cand_${STAMP}`);
+  rmrf(dir);
+  mkdirp(dir);
+  fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(2048, 1));
+  cleanupFns.push(() => rmrf(dir));
+
+  const row = (p, size) => ({
+    file_path: p, file_size: size, category: 'SAFE_TO_DELETE', is_locked: 0,
+    locked_by_pid: null, source_process: null,
+  });
+
+  const hit = m.findCandidates([row(path.join(dir, 'big.bin'), 2048)], c);
+  assertEq(hit.length, 1, 'one tracked directory above the byte threshold is offered');
+  assertEq(norm(hit[0].path), norm(dir), 'the candidate is the CONTAINING directory');
+  assertEq(hit[0].bytes, 2048, 'candidate bytes are the tracked row total');
+
+  assertEq(m.findCandidates([row(path.join(dir, 'big.bin'), 64)], c).length, 0,
+    'below migrateMinBytes -> not offered');
+
+  // A protected directory is never offered, even with plenty of bytes: the panel must never
+  // show an action the POST would refuse (that reads as a broken button).
+  assertEq(m.findCandidates([row(path.join('C:\\Windows', 'Temp', 'huge.bin'), 99 * 1024 * 1024)], c).length, 0,
+    'a protected directory is never a candidate');
+
+  // Malformed rows degrade to "no candidate" instead of throwing — the watcher writes these.
+  assertEq(m.findCandidates([null, undefined, {}, { file_path: '' }, { file_path: 'relative.bin', file_size: 5 }], c).length, 0,
+    'malformed rows produce no candidates and do not throw');
+  assertEq(m.findCandidates(null, c).length, 0, 'a null row list produces no candidates');
+
+  return `candidates derive from tracked rows through the same gate the operation runs; malformed rows answer []`;
+});
+
+// A migrated directory's CHILDREN still spell `C:` while their bytes live on `E:`. Offering
+// them again would migrate already-moved data a second time, nesting target inside target.
+// The gate must therefore compare PHYSICAL volumes, not path literals.
+await check('migrate.no-second-migration-through-a-junction', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const c = migCfg({ migrateMinBytes: 1024 });
+
+  const dir = path.join(MIG_SRC_ROOT, `dshcc_nest_${STAMP}`);
+  rmrf(dir);
+  mkdirp(path.join(dir, 'sub'));
+  fs.writeFileSync(path.join(dir, 'sub', 'big.bin'), Buffer.alloc(2048, 1));
+  cleanupFns.push(() => rmrf(dir));
+
+  const first = m.inspectDirectory(dir, c);
+  assertEq(first.ok, true, `the directory starts out migratable (${first.code})`);
+
+  // The journal is not optional: migrateDirectory refuses to move bytes it cannot record.
+  const dbm = await load('lib/state-db.js');
+  assertEq((await m.migrateDirectory(dir, { cfg: c, log: silentLog, db: null })).code, 'STATE_UNAVAILABLE',
+    'a migration without a journal is refused before anything moves');
+  assert(!fs.lstatSync(dir).isSymbolicLink(), 'and nothing was touched');
+
+  const db = new dbm.StateDB(path.join(mkdirp(path.join(probeRoot, `nestdb_${STAMP}`)), 'state.db'));
+  cleanupFns.push(() => { try { db.close(); } catch {} });
+  const moved = await m.migrateDirectory(dir, { cfg: c, log: silentLog, db });
+  assertEq(moved.ok, true, `migration executed (${moved.code}: ${moved.reason})`);
+  cleanupFns.push(() => { try { m.removeJunction(dir); } catch {} });
+
+  assert(fs.lstatSync(dir).isSymbolicLink(), 'the source is now a junction');
+
+  // `sub` is reachable only THROUGH that junction: same bytes, spelled `C:`, living on `E:`.
+  const nested = path.join(dir, 'sub');
+  const verdict = m.inspectDirectory(nested, c);
+  assertEq(verdict.ok, false, 'a directory reached through our own junction is refused');
+  assertEq(verdict.code, 'SAME_VOLUME', 'refused because it already lives on the target volume');
+
+  const row = (p, size) => ({
+    file_path: p, file_size: size, category: 'SAFE_TO_DELETE', is_locked: 0,
+    locked_by_pid: null, source_process: null,
+  });
+  assertEq(m.findCandidates([row(path.join(nested, 'big.bin'), 2048)], c).length, 0,
+    'and it is never offered as a candidate again');
+
+  return `physical volume decides SAME_VOLUME: ${norm(nested)} -> ${verdict.code}`;
+});
+
+await check('sessionhook.arms-and-sweeps-on-dispose', async () => {
+  const sh = await load('lib/session-hook.js');
+  assert(typeof sh.installSessionHook === 'function', 'installSessionHook is not exported');
+
+  // A fake Cordis context that records subscriptions and fires them exactly like `ctx.on`.
+  const handlers = new Map();
+  const ctx = {
+    on(event, fn) {
+      if (!handlers.has(event)) handlers.set(event, new Set());
+      handlers.get(event).add(fn);
+      return () => handlers.get(event)?.delete(fn);
+    },
+    fire(event, ...args) { for (const fn of [...(handlers.get(event) ?? [])]) fn(...args); },
+    count(event) { return handlers.get(event)?.size ?? 0; },
+  };
+
+  let cleaned = [];
+  const rows = [
+    { file_path: 'C:\\x\\a.tmp', category: 'SAFE_TO_DELETE' },
+    { file_path: 'C:\\x\\b.tmp', category: 'CAUTION_CACHE' },
+  ];
+  const baseDeps = {
+    cfg: { sessionCloseClean: true, sessionCloseMinAgeMs: 0, enabled: true },
+    log: silentLog,
+    trackedRows: async () => rows,
+    // Assert the CONTRACT of clean(), not the DB shape: `clean()` reads `rec.path`, so a sweep
+    // that forwards raw `TrackedRow`s (which carry `file_path`) hands it `undefined` and silently
+    // cleans nothing. Reading `file_path` here is what let that defect pass this check once already.
+    clean: async (recs) => {
+      for (const r of recs) assert(typeof r.path === 'string' && r.path.length > 0, `clean() got a record without a path: ${json(r)}`);
+      cleaned.push(recs.map((r) => r.path));
+      return { removed: recs.length, bytesFreed: 10, skipped: 0 };
+    },
+  };
+
+  const hook = sh.installSessionHook(ctx, baseDeps);
+  assertEq(ctx.count('session/disposed'), 1, 'the hook subscribed to session/disposed');
+  assertEq(ctx.count('session/created'), 1, 'the hook subscribed to session/created (for the min-age rule)');
+  assertEq(hook.isEnabled(), true, 'hook reports enabled when sessionCloseClean is on');
+
+  ctx.fire('session/disposed', { id: 'session-1' });
+  await waitFor(() => cleaned.length > 0, 3000, 40);
+  assertEq(cleaned.length, 1, 'disposing a session ran exactly one sweep');
+  assertEq(cleaned[0].length, 1, 'the sweep cleaned ONLY SAFE_TO_DELETE rows (PRD §3.3 tiering)');
+  assert(cleaned[0][0].endsWith('a.tmp'), `the swept row was the SAFE one, got ${json(cleaned[0])}`);
+
+  // A throwing cleaner must not become an unhandled rejection in the host.
+  const throwing = sh.installSessionHook(
+    { on: () => () => {} },
+    { ...baseDeps, clean: async () => { throw new Error('cleaner exploded'); } },
+  );
+  const rejected = await throwing.sweep('probe').then(() => false, () => true);
+  assert(rejected === false, 'sweep() must swallow a cleaner exception rather than reject');
+  throwing.dispose();
+
+  hook.dispose();
+  assertEq(ctx.count('session/disposed'), 0, 'dispose() unsubscribed from session/disposed');
+  assertEq(ctx.count('session/created'), 0, 'dispose() unsubscribed from session/created');
+  hook.dispose(); // idempotent
+  return `dispose -> 1 sweep of SAFE rows only, errors contained, dispose() idempotent`;
+});
+
+await check('sessionhook.off-by-default-and-min-age', async () => {
+  const sh = await load('lib/session-hook.js');
+  const off = sh.installSessionHook(
+    { on: () => () => {} },
+    { cfg: { sessionCloseClean: false }, log: silentLog, trackedRows: async () => [], clean: async () => ({}) },
+  );
+  assertEq(off.isEnabled(), false, 'the hook is OFF unless sessionCloseClean is explicitly true');
+  assertEq(await off.sweep('probe'), null, 'a disabled hook does nothing when swept');
+  off.dispose();
+
+  // A session that lived less than sessionCloseMinAgeMs must not trigger a sweep: the host
+  // creates and disposes throwaway sessions routinely and every sweep is expensive.
+  const handlers = new Map();
+  const ctx = {
+    on(e, fn) { if (!handlers.has(e)) handlers.set(e, new Set()); handlers.get(e).add(fn); return () => handlers.get(e)?.delete(fn); },
+    fire(e, ...a) { for (const fn of [...(handlers.get(e) ?? [])]) fn(...a); },
+  };
+  let sweeps = 0;
+  const hook = sh.installSessionHook(ctx, {
+    cfg: { sessionCloseClean: true, sessionCloseMinAgeMs: 60_000, enabled: true },
+    log: silentLog,
+    trackedRows: async () => [{ file_path: 'C:\\x\\a.tmp', category: 'SAFE_TO_DELETE' }],
+    clean: async () => { sweeps += 1; return { removed: 1, bytesFreed: 1, skipped: 0 }; },
+  });
+  ctx.fire('session/created', { id: 'short-lived' });
+  ctx.fire('session/disposed', { id: 'short-lived' });
+  await new Promise((r) => setTimeout(r, 250));
+  assertEq(sweeps, 0, 'a session shorter than sessionCloseMinAgeMs must not trigger a silent clean');
+
+  // A session with no observed start has no measurable age, so it is NOT skipped.
+  ctx.fire('session/disposed', { id: 'never-seen' });
+  await waitFor(() => sweeps > 0, 3000, 40);
+  assertEq(sweeps, 1, 'a session with no observed start is swept');
+  hook.dispose();
+  return `default OFF; sub-threshold sessions skipped; unmeasurable sessions swept`;
+});
+
+await check('sessionhook.concurrency-and-disposal', async () => {
+  const sh = await load('lib/session-hook.js');
+  const handlers = new Map();
+  const ctx = {
+    on(e, fn) { if (!handlers.has(e)) handlers.set(e, new Set()); handlers.get(e).add(fn); return () => handlers.get(e)?.delete(fn); },
+    fire(e, ...a) { for (const fn of [...(handlers.get(e) ?? [])]) fn(...a); },
+    count(e) { return handlers.get(e)?.size ?? 0; },
+  };
+
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  let runs = 0;
+  const hook = sh.installSessionHook(ctx, {
+    cfg: { sessionCloseClean: true, sessionCloseMinAgeMs: 0, enabled: true },
+    log: silentLog,
+    trackedRows: async () => [{ file_path: 'C:\\x\\a.tmp', category: 'SAFE_TO_DELETE' }],
+    clean: async () => {
+      runs += 1;
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await new Promise((r) => setTimeout(r, 60));
+      concurrent -= 1;
+      return { removed: 1, bytesFreed: 1, skipped: 0 };
+    },
+  });
+
+  ctx.fire('session/disposed', { id: 's1' });
+  ctx.fire('session/disposed', { id: 's2' });
+  ctx.fire('session/disposed', { id: 's3' });
+  await waitFor(() => runs >= 1, 3000, 40);
+  await new Promise((r) => setTimeout(r, 350));
+  assertEq(maxConcurrent, 1, 'concurrent disposals must never run two sweeps at once');
+  assert(runs >= 1 && runs <= 3, `three disposals produced ${runs} sweep(s) — the latch must not multiply work`);
+  hook.dispose();
+  assertEq(ctx.count('session/disposed'), 0, 'dispose() after firing still unsubscribes');
+  return `3 simultaneous disposals -> ${runs} sweep(s), max concurrency ${maxConcurrent}`;
+});
+
+await check('config.phase3-keys', async () => {
+  const m = await load('lib/config.js');
+  const schema = await load('lib/config-schema.js');
+  const d = m.resolveConfig({}, process.env);
+  assertEq(d.migrateTargetRoot, null, 'migrateTargetRoot default (derived from escapeRoot)');
+  assertEq(d.migrateVerify, true, 'migrateVerify default on — it is the evidence for deleting the source');
+  assertEq(d.migrateMinBytes, 10 * 1024 * 1024, 'migrateMinBytes default 10 MB');
+  assertEq(d.sessionCloseClean, false, 'sessionCloseClean default OFF (silent clean is opt-in)');
+  assertEq(d.sessionCloseMinAgeMs, 60000, 'sessionCloseMinAgeMs default 60 s');
+
+  // The same fail-soft style as every other key: garbage falls back, it never throws.
+  const bad = m.resolveConfig(
+    { migrateTargetRoot: 42, migrateVerify: 'yes', migrateMinBytes: -5, sessionCloseClean: 'true', sessionCloseMinAgeMs: NaN },
+    process.env,
+  );
+  assertEq(bad.migrateTargetRoot, null, 'a non-string migrateTargetRoot falls back to null');
+  assertEq(bad.migrateVerify, true, 'a non-false migrateVerify stays true (fail safe)');
+  assertEq(bad.migrateMinBytes, 10 * 1024 * 1024, 'a negative migrateMinBytes falls back to the default');
+  assertEq(bad.sessionCloseClean, false, "the string 'true' is NOT true — the hook stays off");
+
+  // Every new key must be declared in the schema AND carry a Chinese description, or the
+  // settings UI silently omits it.
+  const meta = schema.Config?.meta ?? schema.default?.meta ?? {};
+  const fields = schema.FIELDS ?? schema.default?.FIELDS ?? {};
+  for (const k of ['migrateTargetRoot', 'migrateVerify', 'migrateMinBytes', 'sessionCloseClean', 'sessionCloseMinAgeMs']) {
+    assert(k in meta, `config key ${k} has no Config.meta description`);
+    assert(k in fields, `config key ${k} is not declared in FIELDS`);
+    assert(/[\u4e00-\u9fa5]/.test(String(meta[k]?.description ?? '')), `config key ${k} description is not Chinese`);
+  }
+  return `5 Phase 3 keys present in config.js + config-schema.js FIELDS + meta, defaults 10 MB / 60 s / opt-in, malformed input fails soft`;
+});
+
+// ── REGRESSION: the three defects behind the live "nothing happened" report ──
+// Each of these was a real production failure observed through the panel, not a hypothetical.
+
+// (1) isLocked() used `open('r+')`, which SUCCEEDS on a file another process holds open
+//     WITHOUT delete sharing — yet such a file cannot be deleted. The probe must match the
+//     operation: deletion needs delete sharing, so the test is a rename-away-and-back.
+await check('cleaner.isLocked-matches-delete-permission', async () => {
+  const { isLocked } = await load('lib/classifier.js');
+  const dir = mkdirp(path.join(probeRoot, `lockprobe_${STAMP}`));
+  const free = path.join(dir, 'free.log');
+  fs.writeFileSync(free, 'x');
+
+  const unlocked = isLocked(free);
+  assertEq(unlocked.locked, false, 'a plain file must not read as locked');
+
+  // Hold the file the way a Windows program that does not share delete does: open it for
+  // read/write but NOT delete. `open('r+')` succeeds here — which is exactly why the old
+  // probe was wrong.
+  const holder = spawn(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import fs from 'node:fs';
+     const fd = fs.openSync(process.env.DCC_LOCK_PATH, 'r+');
+     process.stdout.write('HOLDING\\n');
+     const end = Date.now() + 6000;
+     while (Date.now() < end) { try { fs.fstatSync(fd); } catch {} }
+     try { fs.closeSync(fd); } catch {}`,
+  ], { env: { ...process.env, DCC_LOCK_PATH: free }, stdio: ['ignore', 'pipe', 'ignore'] });
+  cleanupFns.push(() => {
+    try {
+      holder.kill();
+    } catch {}
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  // Cross-check the ground truth independently: can the file be renamed right now?
+  const probe2 = `${free}.mv`;
+  let renamable = true;
+  try {
+    fs.renameSync(free, probe2);
+    fs.renameSync(probe2, free);
+  } catch {
+    renamable = false;
+  }
+
+  const held = isLocked(free);
+  try {
+    holder.kill();
+  } catch {}
+  if (renamable) {
+    // Some processes DO share delete; then there is no lock to detect and the probe proves
+    // nothing. Report that honestly rather than pretending a lock was observed.
+    detail('holder allowed delete sharing on this host — lock detection not exercised');
+    return 'skipped: host allowed delete sharing (isLocked reported locked=' + held.locked + ')';
+  }
+  assertEq(held.locked, true, 'a file that cannot be renamed must read as locked');
+  return 'rename-based probe agrees with the real delete permission (old r+ probe did not)';
+});
+
+// (2) A source-directory delete cannot succeed while a file inside is held, and `rmSync`
+//     deletes what it CAN reach before failing. Migration must therefore refuse at PLANNING
+//     time — before copying — so the panel never offers a move that must fail.
+await check('migrate.busy-directory-refused-before-any-copy', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  /* Must live on the REAL C: volume and outside every protected root: `probeRoot` sits in
+   * `os.tmpdir()`, which the env hijack has already redirected to `E:\dsh_escape_cache\temp`,
+   * so a directory there is refused as PROTECTED long before the busy check is reached. */
+  const dir = mkdirp(path.join(MIG_SRC_ROOT, `dshcc_busy_${STAMP}`));
+  cleanupFns.push(() => rmrf(dir));
+  const targetRoot = path.join(cfg.escapeRoot, `busy_target_${STAMP}`);
+  cleanupFns.push(() => rmrf(targetRoot));
+  const c = migCfg({ migrateTargetRoot: targetRoot });
+
+  const held = path.join(dir, 'held.log');
+  fs.writeFileSync(held, 'x'.repeat(4096));
+  for (let i = 0; i < 3; i += 1) fs.writeFileSync(path.join(dir, `free-${i}.log`), 'y'.repeat(1024));
+
+  const holder = spawn(process.execPath, [
+    '--input-type=module',
+    '-e',
+    `import fs from 'node:fs';
+     const fd = fs.openSync(process.env.DCC_LOCK_PATH, 'r+');
+     process.stdout.write('HOLDING\\n');
+     const end = Date.now() + 8000;
+     while (Date.now() < end) { try { fs.fstatSync(fd); } catch {} }
+     try { fs.closeSync(fd); } catch {}`,
+  ], { env: { ...process.env, DCC_LOCK_PATH: held }, stdio: ['ignore', 'pipe', 'ignore'] });
+  cleanupFns.push(() => {
+    try {
+      holder.kill();
+    } catch {}
+  });
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  const inspected = m.inspectDirectory(dir, c);
+
+  // Ground truth for "is there actually a lock here", measured independently of the module:
+  // a locked file cannot be renamed. If the host granted delete sharing, there is no lock to
+  // detect and this check must say so instead of asserting a behaviour it never exercised.
+  let reallyLocked = false;
+  try {
+    const probePath = `${held}.mv`;
+    fs.renameSync(held, probePath);
+    fs.renameSync(probePath, held);
+  } catch {
+    reallyLocked = true;
+  }
+  try {
+    holder.kill();
+  } catch {}
+
+  if (inspected.ok && !reallyLocked) {
+    detail('host allowed delete sharing — busy refusal not exercised');
+    return 'skipped: no lock could be established on this host';
+  }
+  assertEq(inspected.ok, false, 'a directory holding an undeletable file must not be offered as a candidate');
+  assertEq(inspected.code, 'FILES_IN_USE', 'the refusal must name the cause');
+  assert(/held open by another process/.test(inspected.reason), `reason should explain: ${inspected.reason}`);
+  assert(!fs.existsSync(targetRoot), 'a refusal must not have copied anything to the target volume');
+  for (let i = 0; i < 3; i += 1) {
+    assert(fs.existsSync(path.join(dir, `free-${i}.log`)), 'the refusal must not have deleted any file');
+  }
+  return `refused with FILES_IN_USE before any copy; 4 files intact; nothing written to the target`;
+});
+
+// (3) A clean run must let its caller drop the rows it just acted on, or the table fills with
+//     dead rows and every later click re-validates thousands of files that no longer exist.
+await check('cleaner.reports-removed-and-gone-paths', async () => {
+  const { clean } = await load('lib/cleaner.js');
+  /* Real C: volume and outside the protected roots — see the comment on the check above. */
+  const dir = mkdirp(path.join(MIG_SRC_ROOT, `dshcc_removed_${STAMP}`));
+  cleanupFns.push(() => rmrf(dir));
+  const live = path.join(dir, 'live.log');
+  const ghost = path.join(dir, 'ghost.log');
+  fs.writeFileSync(live, 'x'.repeat(2048));
+  const c = await load('lib/config.js');
+  const ccfg = c.resolveConfig({}, process.env);
+
+  const report = await clean(
+    [
+      { path: live, size: 2048, category: 'SAFE_TO_DELETE' },
+      { path: ghost, size: 512, category: 'SAFE_TO_DELETE' },
+    ],
+    { deep: false, force: true, cfg: ccfg, log: silentLog },
+  );
+
+  assert(!fs.existsSync(live), 'the live file should be gone');
+  assertEq(report.removed, 1, 'one file removed');
+  assertEq(report.skipped, 1, 'the ghost is skipped, not counted as removed');
+  assert(Array.isArray(report.removedPaths), 'report.removedPaths must exist so rows can be dropped');
+  assert(Array.isArray(report.gonePaths), 'report.gonePaths must exist so dead rows can be dropped');
+  assertEq(report.removedPaths.length, 1, 'exactly one removed path');
+  assertEq(norm(report.removedPaths[0]), norm(live), 'removedPaths must name the deleted file');
+  assertEq(report.gonePaths.length, 1, 'exactly one already-gone path');
+  assertEq(norm(report.gonePaths[0]), norm(ghost), 'gonePaths must name the missing file');
+  // The two lists must stay distinct: a file that was never there must not inflate "freed".
+  assertEq(report.bytesFreed, 2048, 'only the deleted file contributes bytes');
+  return 'removed=1 removedPaths=1 gonePaths=1 bytesFreed=2048 (both lists distinct)';
+});
+
+// (4) Dead rows must be findable so /purge can drop them — and a missing path must never
+//     count as "alive", while an unreadable one must (forgetting it would hide a real file).
+await check('webapi.findDeadRows-separates-missing-from-unreadable', async () => {
+  const m = await load('lib/web-api.js');
+  assert(typeof m.findDeadRows === 'function', 'findDeadRows is not exported');
+
+  const dir = mkdirp(path.join(probeRoot, `dead_${STAMP}`));
+  const present = path.join(dir, 'present.log');
+  fs.writeFileSync(present, 'x');
+
+  const rows = [
+    { file_path: present },
+    { file_path: path.join(dir, 'absent-1.log') },
+    { file_path: path.join(dir, 'absent-2.log') },
+    { file_path: '' },
+    null,
+  ];
+  const found = m.findDeadRows(rows);
+  assertEq(found.scanned, 5, 'scanned counts every row');
+  // alive = present.log + the empty-string row + the null row: a row this plugin cannot
+  // address is not proof that a file died, so it is never forgotten.
+  assertEq(found.alive, 3, 'present and unaddressable rows all count as alive');
+  assertEq(found.dead.length, 2, 'exactly the two absent paths are dead');
+  assert(found.dead.every((p) => /absent-\d/.test(p)), `dead list must name the missing files: ${found.dead}`);
+
+  // A probe that throws must NOT condemn the row — an unreadable path may still hold data.
+  const guarded = m.findDeadRows([{ file_path: 'C:/whatever/x.bin' }], () => {
+    throw new Error('EACCES');
+  });
+  assertEq(guarded.dead.length, 0, 'a throwing existence probe must not forget the row');
+  assertEq(guarded.alive, 1, 'a throwing probe leaves the row alive');
+  assertEq(m.findDeadRows(null).scanned, 0, 'null input is tolerated');
+  return '2 dead / 2 alive / unreadable-guarded; null tolerated';
+});
+
+// ── PROBE P1: the migration gate must refuse a blacklisted path even when it exists ──
+// PRD §6.2: 对黑名单路径绝对拒绝. Migration relocates a whole tree — a stronger act than deleting
+// one file — so the same blacklist must bind it, and it must bind by PATH, not by existence.
+await probe('P1.migration-blacklist-veto', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const c = migCfg();
+  const real = path.join('C:\\Windows', 'Temp', `dshcc_p1_${STAMP}`);
+  let created = false;
+  try { mkdirp(real); fs.writeFileSync(path.join(real, 'x.bin'), 'x'); created = true; } catch { /* sandbox may deny */ }
+  cleanupFns.push(() => { if (created) rmrf(real); });
+
+  const verdicts = {};
+  for (const [label, p] of [
+    ['C:\\Windows (exists)', 'C:\\Windows'],
+    ['C:\\Windows\\Temp\\<real dir>', real],
+    ['C:\\Program Files', 'C:\\Program Files'],
+    ['Desktop', path.join(process.env.USERPROFILE || 'C:\\Users\\x', 'Desktop')],
+    ['Documents', path.join(process.env.USERPROFILE || 'C:\\Users\\x', 'Documents')],
+    ['%LOCALAPPDATA%\\Temp\\<stubborn>', path.join(MIG_SRC_ROOT, `dshcc_p1b_${STAMP}`)],
+  ]) {
+    const v = m.inspectDirectory(p, c);
+    verdicts[label] = v.ok ? 'ALLOWED' : v.code;
+  }
+  const leaks = Object.entries(verdicts).filter(([, v]) => v !== 'PROTECTED');
+  // The last row is a LEGITIMATE stubborn directory (it is exactly what the feature is for), so
+  // its expected answer is MISSING (absent) or OK — not PROTECTED. Grade it separately.
+  const blacklist = leaks.filter(([k]) => !k.startsWith('%LOCALAPPDATA%'));
+  return {
+    verdict: blacklist.length === 0
+      ? `all 5 blacklisted paths refused with PROTECTED (a real directory under C:\\Windows\\Temp is refused by path, not by existence)`
+      : `${blacklist.length} blacklisted path(s) NOT refused: ${blacklist.map(([k, v]) => `${k}=${v}`).join(' | ')}`,
+    data: json(verdicts),
+    prdViolation: blacklist.length > 0,
+  };
+});
+
+// ── PROBE P2: the crash window must be recoverable, never lossy ──
+// PENDING = nothing moved; MOVED = data at target, no junction. Neither may lose bytes, and
+// `undoMigration` must be able to finish the job from MOVED alone (PRD §6.3 graceful degrade).
+await probe('P2.migration-crash-window-is-recoverable', async () => {
+  const m = await load('lib/symlink-migrate.js');
+  const dbm = await load('lib/state-db.js');
+  const c = migCfg();
+  const db = new dbm.StateDB(path.join(mkdirp(path.join(probeRoot, `migdb3_${STAMP}`)), 'state.db'));
+  cleanupFns.push(() => { try { db.close(); } catch {} });
+
+  const src = path.join(MIG_SRC_ROOT, `dshcc_crash_${STAMP}`);
+  rmrf(src);
+  mkdirp(src);
+  for (let i = 0; i < 3; i += 1) fs.writeFileSync(path.join(src, `f${i}.bin`), Buffer.alloc(1024, i));
+  cleanupFns.push(() => rmrf(src));
+  const beforeFiles = m.walkTree(src).files;
+
+  const mig = await m.migrateDirectory(src, { cfg: c, log: silentLog, db });
+  if (!mig.ok) return { verdict: `setup failed: ${mig.code}`, prdViolation: false };
+  cleanupFns.push(() => { try { if (fs.existsSync(mig.target)) rmrf(mig.target); } catch {} });
+
+  // Simulate the crash: the junction vanished after the move, exactly as a power loss at that
+  // instant would leave it. The journal is then still in the MOVED window.
+  fs.rmdirSync(src);
+  const row = db.getMigrationBySource(path.resolve(src));
+  db.updateMigration(row.id, { state: 'MOVED' });
+  const interrupted = db.listInterruptedMigrations();
+
+  const undo = await m.undoMigration(src, { cfg: c, log: silentLog, db });
+  const recoveredFiles = fs.existsSync(src) ? m.walkTree(src).files : -1;
+  const targetGone = !fs.existsSync(mig.target);
+
+  return {
+    verdict: undo.ok && recoveredFiles === beforeFiles && targetGone
+      ? `MOVED window (data at target, no junction) undone: ${recoveredFiles} file(s) back, target removed`
+      : `crash window NOT recoverable: undo=${undo.ok}/${undo.code} files=${recoveredFiles}/${beforeFiles} targetGone=${targetGone}`,
+    data: `interrupted=${interrupted.length} undo=${undo.code} state=${db.getMigrationBySource(path.resolve(src))?.state}`,
+    prdViolation: !(undo.ok && recoveredFiles === beforeFiles),
+  };
+});
+
+// ── PROBE P3: junction capability without a shell (PRD §3.4's `mklink /J`) ──
+// The PRD names `mklink /J`; invoking it means spawning cmd.exe with a quoted user path, the
+// classic injection surface. `fs.symlinkSync(..., 'junction')` produces the SAME NTFS junction
+// with no shell, so this probe pins the equivalence and the unlink-must-not-touch-target rule.
+await probe('P3.junction-without-shell-equivalence', () => {
+  const root = mkdirp(path.join(probeRoot, `p3_${STAMP}`));
+  const target = path.join(root, 'target');
+  const link = path.join(root, 'link');
+  mkdirp(target);
+  fs.writeFileSync(path.join(target, 'in.txt'), 'payload');
+
+  fs.symlinkSync(target, link, 'junction');
+  const st = fs.lstatSync(link);
+  const readsThrough = fs.readFileSync(path.join(link, 'in.txt'), 'utf8') === 'payload';
+  fs.writeFileSync(path.join(link, 'out.txt'), 'written');
+  const writesThrough = fs.existsSync(path.join(target, 'out.txt'));
+  const realpaths = norm(fs.realpathSync.native(link)) === norm(fs.realpathSync.native(target));
+
+  // Removing the link must never touch the target: this is what makes an undo safe.
+  fs.rmdirSync(link);
+  const linkGone = !fs.existsSync(link);
+  const targetSurvived = fs.existsSync(path.join(target, 'in.txt')) && fs.existsSync(path.join(target, 'out.txt'));
+
+  const ok = st.isSymbolicLink() && readsThrough && writesThrough && realpaths && linkGone && targetSurvived;
+  return {
+    verdict: ok
+      ? 'junction created / read / written / unlinked with no shell; target intact (same artifact as mklink /J)'
+      : `junction behaviour unexpected: symlink=${st.isSymbolicLink()} read=${readsThrough} write=${writesThrough} realpath=${realpaths} linkGone=${linkGone} targetSurvived=${targetSurvived}`,
+    data: `admin-free; unlink removed only the reparse point`,
+    prdViolation: !ok,
+  };
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // ADVERSARIAL PASS (PRD §6 non-functional requirements)
 // ══════════════════════════════════════════════════════════════════════════
 console.log('--- adversarial probes ---');

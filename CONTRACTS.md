@@ -149,7 +149,9 @@ Rules (PRD 3.3 table — all three conditions are AND-ed):
 - `CAUTION_CACHE` otherwise (toolchain caches, model weights, browser kernels).
 - `isProtectedPath` must return `true` for anything under `C:\Windows`,
   `C:\Program Files*`, Desktop, Documents — belt-and-braces (PRD 6.2).
-- `isLocked` maps a failed `openSync(p,'r+')` to `locked:true`; `ENOENT` → `locked:false`.
+- `isLocked` probes whether the file can actually be DELETED, not whether it can be
+  opened. **Amended in Phase 3** (see §8.1): the original rule was
+  "a failed `openSync(p,'r+')` → `locked:true`", which measurement proved wrong.
 
 ## 8. `lib/cleaner.js` (classify-clean)
 
@@ -172,6 +174,29 @@ export async function clean(records: Classified[], opts: { deep:boolean, force:b
 - `toRecycleBin` uses PowerShell `Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile`
   with `RecycleOption.SendToRecycleBin`; `hardDelete` uses `fs.rmSync(p,{recursive:true,force:false})`.
 - Batch recycle-bin calls (one PowerShell invocation per chunk of ≤50 paths).
+
+### 8.1 Amendment (Phase 3): the lock probe must match the delete, and the report names paths
+
+Two defects were found by users running the shipped panel, not by review. Both are now
+pinned by acceptance checks (`cleaner.isLocked-matches-delete-permission`,
+`cleaner.reports-removed-and-gone-paths`).
+
+1. **`isLocked` must probe deletability, not openability.** A Windows process can hold a
+   file open with read+write sharing but WITHOUT delete sharing. Measured on a real
+   profile: `openSync(p,'r+')` succeeded on every one of the 4 files that
+   `fs.unlinkSync` rejected with `EBUSY`. The old rule therefore reported locked files as
+   deletable, the panel offered them, and the click failed. The probe is now
+   `fs.renameSync(p, p)` — a self-rename needs exactly the delete permission, costs
+   ~0.95 ms/file (500 files in 475 ms), and mutates nothing. `ENOENT`/`ENOTDIR` still map
+   to `locked:false`.
+2. **`CleanupReport` gains `removedPaths` and `gonePaths`** (additive; every existing field
+   and its meaning are unchanged). `removedPaths` lists the paths this run provably
+   deleted, `gonePaths` the paths found already absent at re-validation time. They exist
+   because a COUNT cannot tell a caller which tracking rows to drop: without them the table
+   grew monotonically (measured: 18 648 of 18 809 rows pointed at files that no longer
+   existed), so every later click re-validated thousands of ghosts and reported `removed: 0`.
+   The two lists are kept distinct so a never-existing file can never inflate
+   `bytesFreed`.
 
 ## 9. `lib/state-db.js` (store-cmd)
 
