@@ -67,10 +67,11 @@
 *,*::before,*::after{box-sizing:border-box;}
 html,body{margin:0;padding:0;}
 body{
-  min-height:100vh;
+  /* 铺满可用空间：宿主窗口（或插件 iframe）放大时面板跟着长，而不是被居中留出四周空白。 */
+  height:100vh;
+  min-height:520px;
   display:flex;
-  align-items:center;
-  justify-content:center;
+  align-items:stretch;
   padding:16px;
   background:var(--bg-deep);
   color:var(--txt);
@@ -128,10 +129,14 @@ input{font-family:inherit;}
   z-index:1;
   display:flex;
   flex-direction:column;
+  /* 1120×740 是设计基准（UI_SPEC §3），但不再是硬上限：宿主窗口（或插件 iframe）更大时
+     面板要跟着铺满，而不是停在 740px 被 body 居中、四周留白。
+     flex:1 吃掉横向余量，height:100% 吃掉纵向余量；窗口变小则由下面的媒体查询接管。 */
+  flex:1 1 auto;
   width:1120px;
   max-width:100%;
-  height:740px;
-  max-height:calc(100vh - 32px);
+  height:100%;
+  max-height:100%;
   min-height:520px;
   border-radius:20px;
   overflow:hidden;
@@ -1012,7 +1017,9 @@ input{font-family:inherit;}
   }
 }
 @media (max-width:1120px){
-  .app-shell{height:auto;min-height:600px;}
+  /* 窗口比设计基准窄时不再退回固定高度：外壳本来就是流式的，
+     窄不代表矮。只把最小高度调低一点，让它在矮窗口里也留得下 dock。 */
+  .app-shell{min-height:560px;}
 }
 
 /* ---------- 4.11 窄窗口降级：1120 是设计基准，以下是纯容错 ---------- */

@@ -329,10 +329,10 @@ window.__ModuleLoader__.load({
     const PANEL_UI_SRC = 'c-cleaner/ui/index.html';
 
     /*
-     * The height the document was designed for. `.app-shell` is 1120x740 and `body` adds 16px of
-     * padding, so anything below ~772px would clip the dock. When the host gives the panel less
-     * room the wrapper scrolls rather than squashing the layout; when it gives more, the frame
-     * grows to fill it.
+     * The height the document was designed around. `.app-shell` is a 1120x740 design baseline but
+     * now stretches to fill its viewport, and `body` adds 16px of padding. This floor keeps the
+     * dock and the list usable when the host gives the panel less room than the baseline; the
+     * wrapper scrolls instead of squashing the layout. When the host gives more, the frame grows.
      */
     const PANEL_UI_MIN_HEIGHT = 772;
 

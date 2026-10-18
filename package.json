@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-c-cleaner",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "C-drive escape monitor and safe cleaner for DeepSeek Harness",
