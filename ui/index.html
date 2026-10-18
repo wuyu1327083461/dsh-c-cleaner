@@ -1,0 +1,2650 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="color-scheme" content="dark" />
+<title>DSH C-Drive Escape Cleaner</title>
+<!--
+  DSH C-Drive Escape Cleaner · 视觉与交互原型 (Stage 1 · 内置 Mock 数据)
+  ------------------------------------------------------------------
+  对应 UI_SPEC.md 第 1~4 节；数据字段与第 5 节 TrackedFileItem 保持一致。
+  单文件、零外部依赖：不依赖 Tailwind CDN / 在线字体，离线 WebView 可直接打开。
+  设计 token（极光光斑、glass-panel / glass-card 参数、语义色）与规范逐值对应，
+  类名与 Tailwind 写法一一对应（见各段注释），接回 Tailwind 时可直接平移。
+
+  后端对接：文件底部 `Bridge` 对象是唯一出口，已预留 window.pywebview.api 探测。
+    读取状态  Bridge.getState()      -> { files, env, rules, watching_pid }
+    二次校验+清理 Bridge.clean(paths, mode) -> { ok, cleaned[], skipped[{path,reason}], freed_bytes }
+    软链接搬家 Bridge.migrate(path)  -> { ok, target, bytes_moved }
+    刷新句柄  Bridge.refresh()       -> { ok, locked }
+    保存规则  Bridge.saveRules(rules) -> { ok }
+  把 Bridge 换成真实实现（pywebview 或 fetch('/c-cleaner/api/*')）即可，UI 层无需改动。
+-->
+<style>
+/* ============================================================
+   0. Design Tokens（UI_SPEC §2）
+   ============================================================ */
+:root{
+  --bg-deep:#070B14;
+
+  --glass-panel-bg:linear-gradient(135deg,rgba(255,255,255,.09) 0%,rgba(255,255,255,.03) 100%);
+  --glass-card-bg:rgba(255,255,255,.05);
+  --glass-line:rgba(255,255,255,.10);
+  --glass-line-strong:rgba(255,255,255,.14);
+
+  /* 语义状态色 */
+  --safe:#6ee7b7;            /* emerald-300 */
+  --safe-solid:#10b981;      /* emerald-500 */
+  --safe-bg:rgba(16,185,129,.15);
+  --safe-line:rgba(16,185,129,.30);
+
+  --caution:#fcd34d;         /* amber-300 */
+  --caution-solid:#f59e0b;   /* amber-500 */
+  --caution-bg:rgba(245,158,11,.15);
+  --caution-line:rgba(245,158,11,.30);
+
+  --locked:#fda4af;          /* rose-300 */
+  --locked-solid:#f43f5e;    /* rose-500 */
+  --locked-bg:rgba(244,63,94,.15);
+  --locked-line:rgba(244,63,94,.30);
+
+  --cyan:#22d3ee;            /* cyan-400 */
+  --cyan-soft:#a5f3fc;       /* cyan-200 */
+
+  --txt:#f1f5f9;             /* slate-100 */
+  --txt-2:#cbd5e1;           /* slate-300 */
+  --muted:#94a3b8;           /* slate-400 */
+  --muted-2:#64748b;         /* slate-500 */
+
+  --ui:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei","PingFang SC",Roboto,sans-serif;
+  --mono:"JetBrains Mono","Cascadia Code",Consolas,"SFMono-Regular",ui-monospace,monospace;
+}
+
+/* ============================================================
+   1. Base
+   ============================================================ */
+*,*::before,*::after{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:16px;
+  background:var(--bg-deep);
+  color:var(--txt);
+  font-family:var(--ui);
+  font-size:13px;
+  -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+button{font-family:inherit;color:inherit;}
+input{font-family:inherit;}
+[hidden]{display:none !important;}
+::selection{background:rgba(34,211,238,.28);}
+:focus-visible{outline:2px solid rgba(34,211,238,.65);outline-offset:2px;}
+.dim{color:var(--muted-2);}
+.mono{font-family:var(--mono);}
+
+/* ============================================================
+   2. 极光氛围层（UI_SPEC §2.1，三个固定定位模糊圆）
+   ============================================================ */
+.aurora{position:fixed;border-radius:9999px;pointer-events:none;z-index:0;}
+/* bg-cyan-500/30 w-96 h-96 blur-[130px] top-10 left-20 */
+.aurora-cyan{top:40px;left:80px;width:384px;height:384px;background:rgba(6,182,212,.30);filter:blur(130px);}
+/* bg-purple-600/25 w-[28rem] h-[28rem] blur-[140px] bottom-10 right-20 */
+.aurora-purple{bottom:40px;right:80px;width:448px;height:448px;background:rgba(147,51,234,.25);filter:blur(140px);}
+/* bg-emerald-500/15 w-80 h-80 blur-[120px] 居中 */
+.aurora-emerald{top:50%;left:50%;width:320px;height:320px;transform:translate(-50%,-50%);background:rgba(16,185,129,.15);filter:blur(120px);}
+
+/* ============================================================
+   3. 毛玻璃材质（UI_SPEC §2.2）
+   ============================================================ */
+.glass-panel{
+  background:var(--glass-panel-bg);
+  backdrop-filter:blur(20px);
+  -webkit-backdrop-filter:blur(20px);
+  border:1px solid var(--glass-line-strong);
+  box-shadow:0 20px 50px rgba(0,0,0,.5);
+}
+.glass-card{
+  background:var(--glass-card-bg);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--glass-line);
+  transition:background .2s ease,border-color .2s ease;
+}
+.glass-card:hover{
+  background:rgba(255,255,255,.08);
+  border-color:rgba(255,255,255,.22);
+}
+
+/* ============================================================
+   4. 外壳：1120 × 740 桌面面板
+   ============================================================ */
+.app-shell{
+  position:relative;
+  z-index:1;
+  display:flex;
+  flex-direction:column;
+  width:1120px;
+  max-width:100%;
+  height:740px;
+  max-height:calc(100vh - 32px);
+  min-height:520px;
+  border-radius:20px;
+  overflow:hidden;
+}
+
+/* ---------- 4.1 Header Bar（UI_SPEC §3.1） ---------- */
+.app-header{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  padding:13px 20px;
+  background:rgba(255,255,255,.02);
+  border-bottom:1px solid var(--glass-line);
+}
+.brand-wrap{display:flex;align-items:center;gap:12px;min-width:0;}
+.traffic{display:inline-flex;align-items:center;gap:6px;padding-right:4px;}
+.dot{width:10px;height:10px;border-radius:50%;box-shadow:inset 0 0 0 1px rgba(0,0,0,.25);}
+.dot-rose{background:#f87171;}
+.dot-amber{background:#fbbf24;}
+.dot-emerald{background:#34d399;}
+.brand{
+  font-size:15px;
+  font-weight:700;
+  letter-spacing:.02em;
+  color:#fff;
+  white-space:nowrap;
+}
+.watch-pill{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  padding:3px 9px 3px 8px;
+  border-radius:999px;
+  background:var(--safe-bg);
+  border:1px solid var(--safe-line);
+  color:var(--safe);
+  font:600 10.5px/1.5 var(--mono);
+  white-space:nowrap;
+}
+.ping{position:relative;flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:#34d399;}
+.ping::after{
+  content:"";
+  position:absolute;inset:0;
+  border-radius:50%;
+  background:#34d399;
+  animation:ping 1.6s cubic-bezier(0,0,.2,1) infinite;
+}
+@keyframes ping{
+  0%{transform:scale(1);opacity:.85;}
+  70%,100%{transform:scale(2.8);opacity:0;}
+}
+.header-actions{display:flex;align-items:center;gap:9px;}
+.exempt-badge{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:5px 10px;
+  border-radius:9px;
+  background:rgba(6,182,212,.10);
+  border:1px solid rgba(34,211,238,.30);
+  color:var(--cyan);
+  font:600 10.5px/1.5 var(--mono);
+  white-space:nowrap;
+}
+.btn-ghost{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 11px;
+  border-radius:9px;
+  background:rgba(255,255,255,.07);
+  border:1px solid var(--glass-line-strong);
+  color:var(--txt-2);
+  font-size:11.5px;
+  font-weight:500;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:background .18s,border-color .18s,color .18s;
+}
+.btn-ghost:hover{background:rgba(255,255,255,.13);border-color:rgba(255,255,255,.26);color:#fff;}
+.btn-ghost:disabled{opacity:.55;cursor:not-allowed;}
+.spinning{display:inline-block;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ---------- 4.2 主体网格 ---------- */
+.workspace{
+  flex:1 1 auto;
+  min-height:0;
+  display:grid;
+  grid-template-columns:264px minmax(0,1fr); /* col-span-3 / col-span-9 */
+  gap:14px;
+  padding:16px 20px 0;
+}
+.sidebar{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-height:0;
+  overflow-y:auto;
+  padding-right:2px;
+  scrollbar-width:thin;
+  scrollbar-color:rgba(255,255,255,.16) transparent;
+}
+.sidebar::-webkit-scrollbar{width:5px;}
+.sidebar::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:3px;}
+.main{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-height:0;
+  min-width:0;
+}
+
+/* ---------- 4.3 左侧：监听焦点 / 环境变量劫持（UI_SPEC §3.2） ---------- */
+.side-card{padding:12px 12px 11px;border-radius:14px;flex:0 0 auto;}
+.side-title{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  font-size:10px;
+  font-weight:700;
+  letter-spacing:.13em;
+  text-transform:uppercase;
+  color:var(--muted);
+  margin-bottom:9px;
+}
+.live-tag{
+  font:700 8px var(--mono);
+  letter-spacing:.08em;
+  color:#34d399;
+  background:rgba(16,185,129,.14);
+  border:1px solid rgba(16,185,129,.30);
+  border-radius:4px;
+  padding:1px 5px;
+  transition:color .2s, background .2s, border-color .2s;
+}
+/* 后端没启用 watcher 时指示灯必须变灰：亮着绿灯却一条都不推是最误导的状态 */
+.live-tag.is-off{
+  color:var(--muted-2);
+  background:rgba(148,163,184,.10);
+  border-color:rgba(148,163,184,.24);
+}
+.side-hint{
+  font-size:9px;
+  font-weight:500;
+  letter-spacing:0;
+  text-transform:none;
+  color:var(--muted-2);
+  white-space:nowrap;
+}
+.monitor-list,.env-list{display:flex;flex-direction:column;gap:7px;}
+.monitor-item{
+  padding:8px 9px;
+  border-radius:10px;
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.07);
+  transition:background .2s,border-color .2s;
+}
+.monitor-item.temp{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.26);}
+.monitor-item.local{background:rgba(255,255,255,.03);}
+.monitor-item.roaming{background:rgba(16,185,129,.05);border-color:rgba(16,185,129,.18);}
+.monitor-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;}
+.monitor-name{
+  font:600 10.5px/1.4 var(--mono);
+  color:var(--txt);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.monitor-size{font:700 10px var(--mono);color:#fff;white-space:nowrap;font-variant-numeric:tabular-nums;}
+.monitor-hint{
+  margin-top:2px;
+  font-size:9.5px;
+  line-height:1.4;
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.monitor-bar{margin-top:6px;height:3px;border-radius:2px;background:rgba(255,255,255,.08);overflow:hidden;}
+.monitor-bar i{display:block;height:100%;border-radius:2px;background:linear-gradient(90deg,#38bdf8,#22d3ee);transition:width .45s ease;}
+.monitor-item.roaming .monitor-bar i{background:linear-gradient(90deg,#34d399,#22d3ee);}
+.monitor-item.local .monitor-bar i{background:linear-gradient(90deg,#a78bfa,#22d3ee);}
+.exempt-note{
+  margin-top:9px;
+  padding:8px 9px;
+  border-radius:10px;
+  border:1px dashed rgba(16,185,129,.32);
+  background:rgba(16,185,129,.06);
+  font:600 10px/1.5 var(--mono);
+  color:var(--safe);
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.exempt-note .dim{font-weight:400;color:var(--muted);}
+
+.env-row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:9px;
+  padding:7px 9px;
+  border-radius:10px;
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.06);
+  cursor:pointer;
+  transition:background .18s,border-color .18s;
+}
+.env-row:hover{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.13);}
+.env-text{display:flex;flex-direction:column;gap:2px;min-width:0;}
+.env-label{font:600 10px var(--mono);color:var(--txt-2);white-space:nowrap;}
+.env-target{
+  font:400 9px var(--mono);
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.side-foot{margin:8px 0 0;font-size:9px;line-height:1.5;color:var(--muted-2);}
+
+/* 开关 */
+.switch{
+  appearance:none;
+  -webkit-appearance:none;
+  flex:0 0 auto;
+  width:36px;height:20px;
+  border-radius:999px;
+  background:rgba(255,255,255,.14);
+  border:1px solid rgba(255,255,255,.20);
+  position:relative;
+  cursor:pointer;
+  transition:background .2s,border-color .2s;
+}
+.switch::after{
+  content:"";
+  position:absolute;
+  top:2px;left:2px;
+  width:14px;height:14px;
+  border-radius:50%;
+  background:#cbd5e1;
+  box-shadow:0 1px 3px rgba(0,0,0,.45);
+  transition:transform .2s,background .2s;
+}
+.switch:checked{background:linear-gradient(90deg,#10b981,#06b6d4);border-color:rgba(52,211,153,.55);}
+.switch:checked::after{transform:translateX(16px);background:#fff;}
+
+/* ---------- 4.4 右侧：三级指标卡（UI_SPEC §3.3） ---------- */
+.metrics{flex:0 0 auto;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px;}
+.metric{
+  display:block;
+  width:100%;
+  text-align:left;
+  padding:11px 13px;
+  border-radius:14px;
+  cursor:pointer;
+  color:inherit;
+  font:inherit;
+}
+.metric-label{
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  padding:2px 8px;
+  border-radius:7px;
+  font-size:10.5px;
+  font-weight:700;
+  white-space:nowrap;
+}
+.metric-safe .metric-label{color:var(--safe);background:var(--safe-bg);}
+.metric-caution .metric-label{color:var(--caution);background:var(--caution-bg);}
+.metric-locked .metric-label{color:var(--locked);background:var(--locked-bg);}
+.metric-value{
+  display:flex;
+  align-items:baseline;
+  gap:6px;
+  margin-top:8px;
+  font:800 21px/1.15 var(--mono);
+  letter-spacing:-.02em;
+  color:#fff;
+  font-variant-numeric:tabular-nums;
+}
+.metric-value small{font:600 10px var(--ui);color:var(--muted);letter-spacing:0;}
+.metric-sub{display:block;margin-top:2px;font-size:9.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.metric.is-active{border-color:rgba(255,255,255,.30);box-shadow:0 0 0 1px rgba(255,255,255,.08),0 12px 30px rgba(0,0,0,.30);}
+.metric-safe.is-active{border-color:rgba(52,211,153,.55);}
+.metric-caution.is-active{border-color:rgba(251,191,36,.55);}
+.metric-locked.is-active{border-color:rgba(251,113,133,.55);}
+
+/* ---------- 4.5 文件明细列表 ---------- */
+.list-card{
+  flex:1 1 auto;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  padding:10px 10px 4px 12px;
+  border-radius:14px;
+}
+.list-toolbar{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px;
+  padding-bottom:9px;
+  margin-bottom:2px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+}
+.chips{display:flex;flex-wrap:wrap;gap:5px;}
+.chip{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:4px 9px;
+  border-radius:8px;
+  background:rgba(255,255,255,.04);
+  border:1px solid transparent;
+  color:var(--muted);
+  font-size:10.5px;
+  font-weight:600;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:background .16s,color .16s,border-color .16s;
+}
+.chip:hover{color:#fff;background:rgba(255,255,255,.09);}
+.chip.active{color:#fff;background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.20);}
+.chip[data-filter="safe"].active{color:var(--safe);background:var(--safe-bg);border-color:var(--safe-line);}
+.chip[data-filter="caution"].active{color:var(--caution);background:var(--caution-bg);border-color:var(--caution-line);}
+.chip[data-filter="locked"].active{color:var(--locked);background:var(--locked-bg);border-color:var(--locked-line);}
+.chip .n{font:600 9px var(--mono);opacity:.7;}
+.search{
+  position:relative;
+  margin-left:auto;
+  flex:1 1 150px;
+  max-width:200px;
+  min-width:120px;
+}
+.search .icon{
+  position:absolute;
+  left:8px;top:50%;
+  transform:translateY(-50%);
+  font-size:10px;
+  color:var(--muted-2);
+  pointer-events:none;
+}
+.search input{
+  width:100%;
+  padding:5px 9px 5px 25px;
+  border-radius:8px;
+  background:rgba(255,255,255,.05);
+  border:1px solid var(--glass-line);
+  color:var(--txt);
+  font:500 10.5px var(--mono);
+  outline:none;
+  transition:border-color .18s,background .18s,box-shadow .18s;
+}
+.search input::placeholder{color:var(--muted-2);}
+.search input:focus{
+  border-color:rgba(34,211,238,.45);
+  background:rgba(34,211,238,.07);
+  box-shadow:0 0 0 3px rgba(34,211,238,.10);
+}
+.btn-demo{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:5px 8px;
+  border-radius:8px;
+  background:rgba(34,211,238,.07);
+  border:1px dashed rgba(34,211,238,.35);
+  color:var(--cyan-soft);
+  font-size:10px;
+  font-weight:600;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:background .16s,border-color .16s,color .16s;
+}
+.btn-demo:hover{background:rgba(34,211,238,.16);border-style:solid;color:#fff;}
+
+.file-list{
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  padding:8px 3px 8px 0;
+  scrollbar-width:thin;
+  scrollbar-color:rgba(255,255,255,.17) transparent;
+}
+.file-list::-webkit-scrollbar{width:5px;}
+.file-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.17);border-radius:3px;}
+.file-list::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3);}
+
+.file-row{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:7px 10px;
+  border-radius:11px;
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.08);
+  transition:background .2s,border-color .2s,transform .35s ease-in-out,opacity .35s ease-in-out;
+}
+.file-row:hover{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.17);}
+.file-row.is-checked{background:rgba(16,185,129,.07);border-color:rgba(16,185,129,.30);}
+.file-row[data-cat="locked"]{background:rgba(244,63,94,.05);border-color:rgba(244,63,94,.22);opacity:.85;}
+.file-row[data-cat="locked"]:hover{background:rgba(244,63,94,.08);border-color:rgba(244,63,94,.34);}
+.file-row.is-migrated{background:rgba(16,185,129,.05);border-color:rgba(16,185,129,.20);border-style:dashed;}
+.file-row.row-exit{transform:translateX(40px) scale(.98);opacity:0;pointer-events:none;}
+
+.row-check{flex:0 0 18px;display:flex;align-items:center;justify-content:center;}
+.cb{
+  appearance:none;
+  -webkit-appearance:none;
+  flex:0 0 auto;
+  width:17px;height:17px;
+  border-radius:5px;
+  border:1.5px solid rgba(255,255,255,.30);
+  background:rgba(255,255,255,.06);
+  cursor:pointer;
+  position:relative;
+  transition:background .16s,border-color .16s,box-shadow .16s;
+}
+.cb:hover{border-color:rgba(52,211,153,.75);box-shadow:0 0 0 3px rgba(52,211,153,.12);}
+.cb:checked{
+  background:linear-gradient(135deg,#34d399,#22d3ee);
+  border-color:rgba(52,211,153,.9);
+  box-shadow:0 0 10px rgba(34,211,238,.28);
+}
+.cb:checked::after{
+  content:"";
+  position:absolute;
+  left:5px;top:2px;
+  width:4px;height:8px;
+  border:solid #04241d;
+  border-width:0 2px 2px 0;
+  transform:rotate(42deg);
+}
+.cb:disabled{cursor:not-allowed;opacity:.45;}
+.lock-ico{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:18px;height:18px;
+  border-radius:5px;
+  background:rgba(244,63,94,.18);
+  border:1px solid rgba(244,63,94,.38);
+  font-size:9px;
+  line-height:1;
+  cursor:not-allowed;
+  filter:saturate(.8);
+}
+
+.row-main{flex:1 1 auto;min-width:0;}
+.row-path{
+  font:600 11px/1.4 var(--mono);
+  color:var(--txt);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.row-desc{
+  margin-top:1px;
+  font-size:10px;
+  line-height:1.35;
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.file-row[data-cat="locked"] .row-desc{color:#fda4af;}
+.file-row[data-cat="locked"] .row-path{color:#fecdd3;}
+
+.row-proc{flex:0 0 auto;display:flex;}
+.proc{
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  max-width:148px;
+  padding:2px 7px;
+  border-radius:6px;
+  background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.10);
+  font:500 9.5px var(--mono);
+  color:var(--txt-2);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.proc i{flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:#64748b;}
+.proc.alive i{background:#34d399;box-shadow:0 0 6px rgba(52,211,153,.9);}
+.proc.dead{color:var(--muted-2);}
+.proc.alive{color:#fecdd3;border-color:rgba(244,63,94,.25);background:rgba(244,63,94,.08);}
+
+.row-cat{flex:0 0 auto;display:flex;}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid transparent;
+  font-size:9.5px;
+  font-weight:700;
+  white-space:nowrap;
+}
+.pill-safe{color:var(--safe);background:var(--safe-bg);border-color:var(--safe-line);}
+.pill-caution{color:var(--caution);background:var(--caution-bg);border-color:var(--caution-line);}
+.pill-locked{color:var(--locked);background:var(--locked-bg);border-color:var(--locked-line);}
+.pill-migrated{color:var(--safe);background:rgba(16,185,129,.10);border-color:rgba(16,185,129,.34);}
+
+.row-size{
+  flex:0 0 140px;
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:1px;
+  text-align:right;
+}
+.size-val{
+  font:700 11px var(--mono);
+  color:#fff;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
+.file-row.is-migrated .size-val{color:var(--muted-2);text-decoration:line-through;}
+.link-btn{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  margin-top:1px;
+  padding:2px 6px;
+  border-radius:6px;
+  background:rgba(34,211,238,.16);
+  border:1px solid rgba(34,211,238,.45);
+  color:var(--cyan-soft);
+  font-size:9px;
+  font-weight:700;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:background .16s,box-shadow .16s,color .16s;
+}
+.link-btn:hover{background:rgba(34,211,238,.30);color:#fff;box-shadow:0 0 12px rgba(34,211,238,.25);}
+.link-btn.busy{
+  background:rgba(34,211,238,.10);
+  border-style:dashed;
+  cursor:progress;
+  max-width:246px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.migrated-note{font-size:8.5px;color:var(--muted);white-space:nowrap;}
+.migrated-note.noreason{color:var(--amber);opacity:.78;max-width:190px;overflow:hidden;text-overflow:ellipsis;}
+/* 撤销迁移按钮：同一行的次要动作，用中性色避免和主 CTA 抢注意力。 */
+.link-btn.undo-btn{
+  background:rgba(148,163,184,.14);
+  border-color:rgba(148,163,184,.42);
+  color:var(--muted);
+}
+.link-btn.undo-btn:hover{background:rgba(148,163,184,.26);color:#fff;box-shadow:0 0 10px rgba(148,163,184,.22);}
+.file-row.is-migrating .row-cat{display:none;}
+.file-row.is-migrating .row-size{flex:0 0 auto;max-width:256px;}
+
+.empty{
+  flex:1 1 auto;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:6px;
+  min-height:200px;
+  padding:32px 0;
+  color:var(--muted);
+  font-size:11.5px;
+}
+.empty-ico{font-size:22px;opacity:.75;}
+.empty-sub{font-size:10px;color:var(--muted-2);}
+
+/* ---------- 4.6 底部悬浮操作吧台（UI_SPEC §3.4） ---------- */
+.dock{
+  flex:0 0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  margin:12px 18px 15px;
+  padding:11px 15px;
+  border-radius:16px;
+  background:linear-gradient(135deg,rgba(2,6,23,.68),rgba(2,6,23,.50));
+  backdrop-filter:blur(20px);
+  -webkit-backdrop-filter:blur(20px);
+  border:1px solid rgba(255,255,255,.15);
+  box-shadow:0 18px 42px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.07);
+}
+.dock-summary{min-width:0;flex:1 1 auto;}
+.dock-line{
+  display:block;
+  font-size:12px;
+  line-height:1.5;
+  font-weight:600;
+  color:var(--txt);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.dock-line b{
+  font:800 13px var(--mono);
+  color:#34d399;
+  font-variant-numeric:tabular-nums;
+  padding:0 1px;
+}
+.dock-line b.size{color:var(--cyan);}
+.dock-sub{
+  display:flex;
+  align-items:center;
+  gap:5px;
+  margin-top:2px;
+  font-size:10px;
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.dock-sub b{font:700 10px var(--mono);color:var(--caution);}
+.dock-sub .sep{color:rgba(255,255,255,.18);}
+#modeText{color:var(--txt-2);}
+#modeText.danger{color:#fda4af;font-weight:600;}
+.dock-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto;}
+
+.mode-switch{
+  display:flex;
+  gap:2px;
+  padding:3px;
+  border-radius:10px;
+  background:rgba(255,255,255,.05);
+  border:1px solid var(--glass-line);
+}
+.mode-btn{
+  padding:4px 9px;
+  border:0;
+  border-radius:7px;
+  background:transparent;
+  color:var(--muted);
+  font-size:10.5px;
+  font-weight:600;
+  cursor:pointer;
+  white-space:nowrap;
+  transition:background .16s,color .16s,box-shadow .16s;
+}
+.mode-btn:hover{color:#fff;}
+.mode-btn.active{background:rgba(255,255,255,.14);color:#fff;box-shadow:0 1px 6px rgba(0,0,0,.25);}
+.mode-btn[data-mode="wipe"].active{background:rgba(244,63,94,.20);color:#fecdd3;}
+
+.cta{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:7px;
+  min-width:176px;
+  padding:9px 18px;
+  border:0;
+  border-radius:12px;
+  background:linear-gradient(90deg,#34d399,#22d3ee);
+  color:#04121b;
+  font-size:12.5px;
+  font-weight:800;
+  letter-spacing:.01em;
+  cursor:pointer;
+  white-space:nowrap;
+  box-shadow:0 10px 26px rgba(16,185,129,.28),0 2px 10px rgba(34,211,238,.20);
+  transition:transform .16s,box-shadow .2s,opacity .2s,min-width .2s;
+}
+.cta .cta-ico{font-size:12px;line-height:1;}
+.cta:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 14px 32px rgba(16,185,129,.38),0 3px 14px rgba(34,211,238,.28);}
+.cta:active:not(:disabled){transform:scale(.975);}
+.cta:disabled{opacity:.5;cursor:not-allowed;box-shadow:none;}
+.cta.is-busy,
+.cta.is-busy:disabled{
+  opacity:1;
+  min-width:248px;
+  cursor:progress;
+  background:linear-gradient(90deg,#0f766e,#0e7490);
+  color:#e6fffb;
+  border:1px solid rgba(34,211,238,.35);
+  box-shadow:0 10px 26px rgba(13,148,136,.30);
+  animation:cta-breathe 1.6s ease-in-out infinite;
+}
+@keyframes cta-breathe{
+  0%,100%{box-shadow:0 10px 26px rgba(13,148,136,.30);}
+  50%{box-shadow:0 10px 34px rgba(34,211,238,.42);}
+}
+.spinner{
+  flex:0 0 auto;
+  width:13px;height:13px;
+  border-radius:50%;
+  border:2px solid rgba(255,255,255,.32);
+  border-top-color:#fff;
+  animation:spin .7s linear infinite;
+}
+
+/* ---------- 4.7 Toast（右上角毛玻璃战报） ---------- */
+.toast-wrap{
+  position:absolute;
+  bottom:86px;
+  right:18px;
+  z-index:80;
+  display:flex;
+  flex-direction:column;
+  gap:7px;
+  width:min(322px,calc(100% - 36px));
+  pointer-events:none;
+}
+.toast{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  padding:9px 11px;
+  border-radius:11px;
+  background:linear-gradient(135deg,rgba(17,26,45,.94),rgba(11,18,33,.86));
+  backdrop-filter:blur(18px);
+  -webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:0 18px 40px rgba(0,0,0,.62);
+  color:var(--txt-2);
+  font-size:10.5px;
+  line-height:1.5;
+  pointer-events:auto;
+  animation:toast-in .28s cubic-bezier(.2,.9,.3,1.1);
+}
+.toast .ico{flex:0 0 auto;font-size:12px;line-height:1.35;}
+.toast b{color:#fff;font-weight:700;}
+.toast .mono{font-family:var(--mono);color:var(--cyan-soft);}
+.toast.success{border-color:rgba(52,211,153,.48);}
+.toast.warn{border-color:rgba(251,191,36,.48);}
+.toast.error{border-color:rgba(244,63,94,.50);}
+.toast.info{border-color:rgba(34,211,238,.42);}
+.toast.link{border-color:rgba(34,211,238,.55);}
+.toast.out{animation:toast-out .26s ease forwards;}
+@keyframes toast-in{from{opacity:0;transform:translateX(26px) scale(.97);}to{opacity:1;transform:none;}}
+@keyframes toast-out{to{opacity:0;transform:translateX(26px) scale(.97);}}
+
+/* ---------- 4.8 新行推入 / 锁死闪烁动画（UI_SPEC §4.2 / §4.3） ---------- */
+@keyframes new-row{
+  0%,100%{border-color:rgba(34,211,238,.90);box-shadow:0 0 0 3px rgba(34,211,238,.16),0 0 22px rgba(34,211,238,.30);background:rgba(34,211,238,.10);}
+  50%{border-color:rgba(34,211,238,.34);box-shadow:0 0 0 1px rgba(34,211,238,.05),0 0 8px rgba(34,211,238,.10);background:rgba(34,211,238,.03);}
+}
+@keyframes row-in{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:none;}}
+.file-row.row-new{animation:new-row .75s ease-in-out 2,row-in .28s ease-out;}
+@keyframes lock-flash{
+  0%{box-shadow:0 0 0 3px rgba(244,63,94,.35),0 0 26px rgba(244,63,94,.35);background:rgba(244,63,94,.18);}
+  100%{box-shadow:none;background:rgba(244,63,94,.05);}
+}
+.file-row.just-locked{animation:lock-flash 1.1s ease-out;}
+
+/* ---------- 4.9 规则配置弹窗 ---------- */
+.modal-mask{
+  position:absolute;
+  inset:0;
+  z-index:70;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
+  background:rgba(3,7,18,.55);
+  backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);
+  animation:fade-in .2s ease;
+}
+@keyframes fade-in{from{opacity:0;}to{opacity:1;}}
+.modal{
+  width:520px;
+  max-width:100%;
+  border-radius:16px;
+  overflow:hidden;
+  /* 模态框是实体卡片，压暗背景保证可读性（不叠加两层 backdrop 避免串透） */
+  background:linear-gradient(160deg,#111a2c,#0a1120);
+  box-shadow:0 30px 80px rgba(0,0,0,.72),0 0 0 1px rgba(255,255,255,.06) inset;
+  animation:modal-in .24s cubic-bezier(.2,.9,.3,1.05);
+}
+@keyframes modal-in{from{opacity:0;transform:translateY(10px) scale(.985);}to{opacity:1;transform:none;}}
+.modal-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:13px 15px;
+  border-bottom:1px solid var(--glass-line);
+  background:rgba(255,255,255,.02);
+}
+.modal-title{font-size:12.5px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.modal-sub{font-size:9.5px;font-weight:400;color:var(--muted-2);}
+.icon-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:24px;height:24px;
+  border-radius:7px;
+  border:1px solid var(--glass-line);
+  background:rgba(255,255,255,.05);
+  color:var(--muted);
+  font-size:11px;
+  cursor:pointer;
+  transition:background .16s,color .16s;
+}
+.icon-btn:hover{background:rgba(255,255,255,.12);color:#fff;}
+.modal-body{padding:12px 15px;display:flex;flex-direction:column;gap:7px;max-height:60vh;overflow-y:auto;}
+.rule-group-title{
+  margin:3px 0 1px;
+  font-size:9px;
+  font-weight:700;
+  letter-spacing:.13em;
+  text-transform:uppercase;
+  color:var(--muted-2);
+}
+.rule-row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:8px 10px;
+  border-radius:9px;
+  background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.08);
+  cursor:pointer;
+  transition:background .16s,border-color .16s;
+}
+.rule-row:hover{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.14);}
+.rule-row b{display:block;font:600 10.5px var(--mono);color:var(--txt);}
+.rule-row em{display:block;margin-top:1px;font:normal 9px/1.4 var(--ui);color:var(--muted-2);}
+.modal-foot{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:11px 15px;
+  border-top:1px solid var(--glass-line);
+  background:rgba(255,255,255,.02);
+}
+.link-reset{
+  border:0;
+  background:none;
+  padding:0;
+  color:var(--muted-2);
+  font-size:9.5px;
+  cursor:pointer;
+  text-decoration:underline;
+  text-decoration-style:dotted;
+  text-underline-offset:3px;
+  transition:color .16s;
+}
+.link-reset:hover{color:var(--caution);}
+.btn-cta-sm{
+  padding:7px 14px;
+  border-radius:9px;
+  border:1px solid rgba(34,211,238,.35);
+  background:linear-gradient(90deg,#34d399,#22d3ee);
+  color:#04121b;
+  font-size:11px;
+  font-weight:800;
+  cursor:pointer;
+  transition:transform .16s,box-shadow .2s;
+}
+.btn-cta-sm:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(16,185,129,.30);}
+
+/* ---------- 4.10 降级 / 减少动效 ---------- */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;
+    scroll-behavior:auto !important;
+  }
+}
+@media (max-width:1120px){
+  .app-shell{height:auto;min-height:600px;}
+}
+
+/* ---------- 4.11 窄窗口降级：1120 是设计基准，以下是纯容错 ---------- */
+@media (max-width:1000px){
+  body{padding:10px;}
+  .traffic{display:none;}
+  .app-header{padding:10px 12px;gap:10px;flex-wrap:wrap;}
+  .header-actions{flex-wrap:wrap;gap:7px;}
+  .exempt-badge{font-size:9.5px;padding:4px 8px;}
+  .btn-ghost{padding:5px 9px;font-size:11px;}
+  .workspace{grid-template-columns:212px minmax(0,1fr);gap:10px;padding:12px 12px 0;}
+  .metric{padding:9px 10px;}
+  .metric-value{font-size:17px;flex-wrap:wrap;gap:4px 6px;}
+  .metric-label{font-size:9.5px;padding:2px 6px;}
+  .metric-sub{font-size:8.5px;}
+  .search{min-width:96px;max-width:150px;flex:1 1 110px;}
+  .btn-demo{padding:4px 6px;font-size:9.5px;}
+  .dock{margin:10px 12px 12px;padding:9px 11px;gap:9px;}
+  .dock-summary{font-size:11px;}
+  .cta{min-width:138px;padding:8px 13px;font-size:11.5px;}
+  .cta.is-busy{min-width:186px;}
+  .toast-wrap{width:min(302px,calc(100% - 28px));bottom:74px;right:12px;}
+}
+@media (max-width:860px){
+  .workspace{grid-template-columns:minmax(0,1fr);}
+  .sidebar{flex-direction:row;overflow-x:auto;overflow-y:hidden;padding:0 0 4px;}
+  .sidebar .side-card{flex:1 0 232px;}
+  .app-shell{max-height:none;}
+  .dock{flex-wrap:wrap;}
+}
+</style>
+</head>
+<body>
+
+<!-- ===== 极光背景层 ===== -->
+<div class="aurora aurora-cyan"></div>
+<div class="aurora aurora-purple"></div>
+<div class="aurora aurora-emerald"></div>
+
+<!-- ===== 主毛玻璃容器 ===== -->
+<div class="app-shell glass-panel">
+
+  <!-- ===================== 3.1 顶部状态栏 ===================== -->
+  <header class="app-header">
+    <div class="brand-wrap">
+      <span class="traffic" aria-hidden="true">
+        <span class="dot dot-rose"></span>
+        <span class="dot dot-amber"></span>
+        <span class="dot dot-emerald"></span>
+      </span>
+      <div class="brand">DSH C-Drive Escape Cleaner</div>
+      <span class="watch-pill" title="Watcher 正在监听 dsh 进程树的 C 盘写入">
+        <span class="ping"></span>WATCHING PID: <span id="watchPid">18492</span>
+      </span>
+    </div>
+    <div class="header-actions">
+      <span class="exempt-badge" id="exemptBadge" title="E:\.dsh 不参与扫描，0% 额外开销">✓ $DSH_HOME = E:\.dsh (已豁免监听)</span>
+      <button class="btn-ghost" type="button" id="rulesBtn">⚙️ 规则配置</button>
+      <button class="btn-ghost" type="button" id="refreshBtn"><span id="refreshIco">🔄</span> 刷新句柄状态</button>
+    </div>
+  </header>
+
+  <!-- ===================== 主体 12 栅格 ===================== -->
+  <div class="workspace">
+
+    <!-- ---------- 3.2 左侧（col-span-3） ---------- -->
+    <aside class="sidebar">
+
+      <!-- 上半区：C盘逃逸监听焦点 -->
+      <section class="glass-card side-card">
+        <div class="side-title">
+          <span>C盘逃逸监听焦点</span>
+          <span class="live-tag" id="liveTag" title="实时监听：C 盘逃逸写入会即时推入列表">LIVE</span>
+        </div>
+        <div class="monitor-list" id="monitorList"></div>
+        <div class="exempt-note">
+          <span id="exemptNote">✓ E:\.dsh 已自动跳过</span>
+          <span class="dim">(0% 额外扫描开销)</span>
+        </div>
+      </section>
+
+      <!-- 下半区：事前 E 盘环境变量劫持 -->
+      <section class="glass-card side-card">
+        <div class="side-title">
+          <span>事前 E 盘环境变量劫持</span>
+          <span class="side-hint">dsh 子进程</span>
+        </div>
+        <div class="env-list" id="envList"></div>
+        <p class="side-foot">仅对当前 dsh 会话派生的子进程生效，不修改系统环境变量。</p>
+      </section>
+
+    </aside>
+
+    <!-- ---------- 3.3 右侧主工作区（col-span-9） ---------- -->
+    <main class="main">
+
+      <!-- 三级指标概览卡 -->
+      <div class="metrics" id="metrics">
+        <button type="button" class="metric glass-card metric-safe" data-filter="safe" title="点击仅看可安全删除">
+          <span class="metric-label">🟢 可安全删除</span>
+          <span class="metric-value"><span id="safeBytes">0 MB</span><small id="safeCount">0 项</small></span>
+          <span class="metric-sub">无活跃句柄占用 · 默认勾选</span>
+        </button>
+        <button type="button" class="metric glass-card metric-caution" data-filter="caution" title="点击仅看驻留缓存">
+          <span class="metric-label">🟡 需确认/驻留缓存</span>
+          <span class="metric-value"><span id="cautionBytes">0 MB</span><small id="cautionCount">0 个</small></span>
+          <span class="metric-sub" id="cautionSub">可 mklink 迁移 0 个目录 · 默认不勾选</span>
+        </button>
+        <button type="button" class="metric glass-card metric-locked" data-filter="locked" title="点击仅看占用保护">
+          <span class="metric-label">🔴 正在占用保护</span>
+          <span class="metric-value"><span id="lockedBytes">0 MB</span><small id="lockedCount">0 项</small></span>
+          <span class="metric-sub">WinError 32 占用保护 · 已置灰禁选</span>
+        </button>
+      </div>
+
+      <!-- 文件明细交互表 -->
+      <section class="glass-card list-card">
+        <div class="list-toolbar">
+          <div class="chips" id="filterChips">
+            <button type="button" class="chip active" data-filter="all">全部<span class="n" id="countAll">0</span></button>
+            <button type="button" class="chip" data-filter="safe">🟢 仅看可删<span class="n" id="countSafe">0</span></button>
+            <button type="button" class="chip" data-filter="caution">🟡 仅看缓存<span class="n" id="countCaution">0</span></button>
+            <button type="button" class="chip" data-filter="locked">🔴 仅看锁定<span class="n" id="countLocked">0</span></button>
+          </div>
+          <label class="search">
+            <span class="icon">🔍</span>
+            <input type="text" id="searchInput" placeholder="搜索文件名 / 进程 / PID" autocomplete="off" spellcheck="false" aria-label="按文件名或子进程 PID 搜索" />
+          </label>
+          <button type="button" class="btn-demo" id="simulateBtn" title="演示：模拟后端 Watcher 实时推送一条新的 C 盘逃逸记录">📡 模拟推送</button>
+          <!-- 老面板的「清理过期条目」：只删状态库里的死行（文件已不存在 / 从未通过
+               PRD §3.2 归属闸门），绝不碰磁盘上的任何文件。接真后端后才出现。 -->
+          <button type="button" class="btn-demo" id="purgeBtn" hidden title="清理状态库中已失效的跟踪记录（文件已不存在）——只清记录，不动磁盘文件">🧹 清理过期条目</button>
+        </div>
+
+        <div class="file-list" id="fileList" aria-live="polite"></div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ===================== 3.4 底部悬浮操作吧台 ===================== -->
+  <footer class="dock">
+    <div class="dock-summary" aria-live="polite">
+      <span class="dock-line">
+        当前已勾选 <b id="selCount">0</b> 项文件，预计立即为 C 盘释放 <b class="size" id="selSize">0 MB</b> 空间
+      </span>
+      <span class="dock-sub">
+        已自动跳过 <b id="skipCount">0</b> 个占用中文件
+        <span class="sep">·</span>
+        清理方式 <span id="modeText">🛡️ 移入系统回收站 (send2trash)</span>
+      </span>
+    </div>
+    <div class="dock-actions">
+      <div class="mode-switch" role="group" aria-label="清理模式">
+        <button type="button" class="mode-btn active" data-mode="trash">🛡️ 回收站</button>
+        <button type="button" class="mode-btn" data-mode="wipe">🔥 物理抹除</button>
+      </div>
+      <button type="button" class="cta" id="cleanBtn" disabled>
+        <span class="cta-ico">⚡</span><span>一键安全清理</span>
+      </button>
+    </div>
+  </footer>
+
+  <!-- ===== Toast 容器 ===== -->
+  <div class="toast-wrap" id="toasts" role="status" aria-live="polite"></div>
+
+  <!-- ===== 规则配置弹窗 ===== -->
+  <div class="modal-mask" id="rulesModal" hidden>
+    <div class="glass-panel modal" role="dialog" aria-modal="true" aria-labelledby="rulesTitle">
+      <div class="modal-head">
+        <div class="modal-title" id="rulesTitle">⚙️ 规则配置 <span class="modal-sub">Mock 设置 · 接后端后写入 config.json</span></div>
+        <button type="button" class="icon-btn" data-close="1" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="rule-group-title">监听目录（仅 C 盘逃逸路径）</div>
+        <label class="rule-row">
+          <span><b>%LOCALAPPDATA%\Temp</b><em>沙盒 / 编译临时文件 · 主战场</em></span>
+          <input class="switch" type="checkbox" data-rule="watchTemp" checked />
+        </label>
+        <label class="rule-row">
+          <span><b>%LOCALAPPDATA%</b><em>Playwright / uv / pip 硬编码缓存</em></span>
+          <input class="switch" type="checkbox" data-rule="watchLocal" checked />
+        </label>
+        <label class="rule-row">
+          <span><b>%APPDATA%\Roaming</b><em>Electron / 凭证类残留</em></span>
+          <input class="switch" type="checkbox" data-rule="watchRoaming" checked />
+        </label>
+
+        <div class="rule-group-title">清理策略</div>
+        <label class="rule-row">
+          <span><b>清理前强制二次句柄校验</b><em>瞬时复查 WinError 32，避免误删运行中的文件</em></span>
+          <input class="switch" type="checkbox" data-rule="recheck" checked />
+        </label>
+        <label class="rule-row">
+          <span><b>LOCKED 文件自动跳过</b><em>被 dsh 子进程锁定 / 核心凭证一律置灰</em></span>
+          <input class="switch" type="checkbox" data-rule="skipLocked" checked />
+        </label>
+        <label class="rule-row">
+          <span><b>忽略小于 1 MB 的碎片</b><em>减少列表噪音，保留可追溯记录</em></span>
+          <input class="switch" type="checkbox" data-rule="ignoreSmall" />
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="link-reset" id="resetBtn">↺ 重置 Mock 数据</button>
+        <div style="display:flex;gap:8px;">
+          <button type="button" class="btn-ghost" data-close="1">取消</button>
+          <button type="button" class="btn-cta-sm" id="saveRulesBtn">保存规则</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+     0. 工具
+     ============================================================ */
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const KB = 1024;
+  const MB = 1024 * 1024;
+  const GB = 1024 * 1024 * 1024;
+  const mb = (n) => Math.round(n * MB);
+
+  const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+  const baseName = (p) => String(p).split('\\').pop();
+
+  /** 体积格式化：路径/PID/体积全部走等宽字体（UI_SPEC §2.3） */
+  function formatSize(bytes) {
+    const b = Number(bytes) || 0;
+    if (b <= 0) return '0 MB';
+    if (b >= GB) return (b / GB).toFixed(2) + ' GB';
+    if (b >= MB) return (b / MB).toFixed(1) + ' MB';
+    if (b >= KB) return Math.round(b / KB) + ' KB';
+    return b + ' B';
+  }
+
+  function bytesSum(list, pick) {
+    return list.reduce((sum, f) => sum + (pick ? pick(f) : f.size_bytes), 0);
+  }
+
+  /* ============================================================
+     1. Mock 数据（字段与 UI_SPEC §5 TrackedFileItem 一致）
+        - safe    : 默认勾选
+        - caution : 默认不勾选，可 mklink 搬家
+        - locked  : 🔒 置灰禁选
+        - _lock_on_clean 为 Mock 专用：演示"点清理瞬间被新进程锁死"
+     ============================================================ */
+  const MOCK_FILES = [
+    {
+      id: 'file_9821a',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_sandbox_89a\\output.tmp',
+      description: '临时沙盒快照 · 写入于 4 分钟前',
+      source_process: 'python.exe', pid: 2104, process_alive: false,
+      category: 'safe', size_bytes: mb(148.2), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null,
+      _lock_on_clean: true
+    },
+    {
+      id: 'file_3c77b',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\pip-unpack-x7k92m\\*.whl',
+      description: '残留安装包解压碎片（共 127 个文件）',
+      source_process: 'pip.exe', pid: 7712, process_alive: false,
+      category: 'safe', size_bytes: mb(194.6), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_5de12',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_compile_7fa2\\build.log',
+      description: '编译日志 · 子进程退出后句柄已释放',
+      source_process: 'python.exe', pid: 2104, process_alive: false,
+      category: 'safe', size_bytes: mb(3.4), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_88a41',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\tmp_8f3a1c2e.tmp',
+      description: '一次性临时写入 · 已无任何句柄',
+      source_process: 'code.exe', pid: 31188, process_alive: false,
+      category: 'safe', size_bytes: mb(0.8), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_a1f39',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_node_71c\\vite-*.log',
+      description: '前端构建子进程日志（共 8 个文件）',
+      source_process: 'node.exe', pid: 17620, process_alive: false,
+      category: 'safe', size_bytes: mb(12.6), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_bd204',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\python_build_91k\\*.pyd',
+      description: '编译中间产物 · 可安全删除',
+      source_process: 'cl.exe', pid: 9820, process_alive: false,
+      category: 'safe', size_bytes: mb(41.7), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_c7e18',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\uv-installer-4f2a\\install.log',
+      description: 'uv 安装器日志 · 进程已退出',
+      source_process: 'uv.exe', pid: 14402, process_alive: false,
+      category: 'safe', size_bytes: mb(1.2), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_d4b62',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_sandbox_89a\\stdout.tmp',
+      description: '沙盒 stdout 重定向残留',
+      source_process: 'python.exe', pid: 2104, process_alive: false,
+      category: 'safe', size_bytes: mb(22.9), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_e29f0',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\chrome_headless_2a\\DevToolsActivePort',
+      description: '无头浏览器探针文件 · 极小碎片',
+      source_process: 'chrome.exe', pid: 8852, process_alive: false,
+      category: 'safe', size_bytes: 16 * KB, checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_f6a73',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_snap_41d\\frame-0042.png',
+      description: '截图缓存 · 会话结束后无引用',
+      source_process: 'python.exe', pid: 2104, process_alive: false,
+      category: 'safe', size_bytes: mb(6.8), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_1f0c5',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\pytest-of-YuWu\\pytest-31\\*.pyc',
+      description: 'pytest 临时字节码缓存',
+      source_process: 'python.exe', pid: 6612, process_alive: false,
+      category: 'safe', size_bytes: mb(9.3), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_24d8e',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\fastapi-uvicorn-31a\\access.log',
+      description: '开发服务器访问日志 · 句柄已释放',
+      source_process: 'uvicorn.exe', pid: 12048, process_alive: false,
+      category: 'safe', size_bytes: mb(4.4), checked: true,
+      can_symlink: false, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_7b3a9',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\ms-playwright\\chromium-1140',
+      description: '💡 硬编码逃逸目录：可一键 mklink 软链接迁移至 E 盘',
+      source_process: 'node.exe', pid: 4512, process_alive: false,
+      category: 'caution', size_bytes: mb(890), checked: false,
+      can_symlink: true, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_9c2e1',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\uv\\cache\\wheels-v1',
+      description: 'Python 预编译轮子缓存 · 删除后首次装包略慢',
+      source_process: 'uv.exe', pid: 14402, process_alive: false,
+      category: 'caution', size_bytes: mb(350.4), checked: false,
+      can_symlink: true, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_ac6b8',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\pip\\Cache\\http-v2',
+      description: 'pip 下载缓存 · 可用 PIP_CACHE_DIR 劫持到 E 盘',
+      source_process: 'pip.exe', pid: 7712, process_alive: false,
+      category: 'caution', size_bytes: mb(128.9), checked: false,
+      can_symlink: true, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_bf0d4',
+      path: 'C:\\Users\\YuWu\\AppData\\Roaming\\huggingface\\hub\\models--sentence-transformers--all-MiniLM-L6-v2',
+      description: 'HF_HOME 模型权重缓存 · 可迁移，勿删（重新下载代价高）',
+      source_process: 'python.exe', pid: 6612, process_alive: false,
+      category: 'caution', size_bytes: mb(640), checked: false,
+      can_symlink: true, symlink_migrated: false, lock_reason: null
+    },
+    {
+      id: 'file_c19e7',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_active_stream_01.sqlite-wal',
+      description: '⚠️ WinError 32: 当前任务正在流式写入，严禁删除',
+      source_process: 'dsh-worker', pid: 19208, process_alive: true,
+      category: 'locked', size_bytes: mb(18.5), checked: false,
+      can_symlink: false, symlink_migrated: false,
+      lock_reason: 'WinError 32: 被 dsh-worker (PID: 19208) 占用，当前任务正在流式写入'
+    },
+    {
+      id: 'file_d8a30',
+      path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_worker_9f\\log.pipe',
+      description: '⚠️ 命名管道句柄占用中 · 强制删除会中断正在运行的 worker',
+      source_process: 'dsh-worker', pid: 19208, process_alive: true,
+      category: 'locked', size_bytes: mb(0.4), checked: false,
+      can_symlink: false, symlink_migrated: false,
+      lock_reason: 'WinError 32: 命名管道正被 dsh-worker (PID: 19208) 写入'
+    },
+    {
+      id: 'file_e5b16',
+      path: 'C:\\Users\\YuWu\\AppData\\Roaming\\dsh\\credentials.enc',
+      description: '🔐 核心凭证文件 · 受守护进程保护，禁止删除',
+      source_process: 'dsh-core', pid: 18492, process_alive: true,
+      category: 'locked', size_bytes: 24 * KB, checked: false,
+      can_symlink: false, symlink_migrated: false,
+      lock_reason: '核心凭证文件：受 dsh 主进程保护，禁止删除'
+    }
+  ];
+
+  /* 侧边栏监听目录映射（只展示 C 盘逃逸路径，§1 约束） */
+  const MONITORS = [
+    {
+      key: 'temp',
+      name: '%LOCALAPPDATA%\\Temp',
+      hint: '沙盒 / 编译临时文件 · 实时监听中',
+      test: (p) => /\\AppData\\Local\\Temp\\/i.test(p)
+    },
+    {
+      key: 'local',
+      name: '%LOCALAPPDATA%',
+      hint: '工具链硬编码缓存 (Playwright / uv / pip)',
+      test: (p) => /\\AppData\\Local\\/i.test(p) && !/\\AppData\\Local\\Temp\\/i.test(p)
+    },
+    {
+      key: 'roaming',
+      name: '%APPDATA%\\Roaming',
+      hint: 'Electron / 模型 / 凭证类残留',
+      test: (p) => /\\AppData\\Roaming\\/i.test(p)
+    }
+  ];
+
+  /* 事前环境变量劫持（UI_SPEC §3.2） */
+  const ENV_VARS = [
+    { key: 'temp', label: 'TEMP / TMP', target: 'E:\\dsh_escape_cache\\temp', enabled: true },
+    { key: 'pip', label: 'PIP_CACHE_DIR', target: 'E:\\dsh_escape_cache\\pip', enabled: true },
+    { key: 'hf', label: 'HF_HOME / UV_CACHE', target: 'E:\\dsh_escape_cache\\hf', enabled: true }
+  ];
+
+  /* Mock 实时推送池 */
+  const PUSH_POOL = [
+    { path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_sandbox_b71\\trace.json', description: '实时捕获 · 沙盒子进程写入完成，句柄已释放', source_process: 'python.exe', pid: 25612, size: 37.6 },
+    { path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_node_55a\\npm-debug.log', description: '实时捕获 · Node 子进程异常退出残留', source_process: 'node.exe', pid: 26340, size: 2.7 },
+    { path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_tool_8e1\\tool-result.tmp', description: '实时捕获 · 工具调用结果临时落盘', source_process: 'python.exe', pid: 25612, size: 15.2 },
+    { path: 'C:\\Users\\YuWu\\AppData\\Local\\Temp\\dsh_build_c03\\artifact.zip', description: '实时捕获 · 构建产物临时归档', source_process: '7z.exe', pid: 27604, size: 63.8 }
+  ];
+
+  /* ============================================================
+     2. 运行时状态
+     ============================================================ */
+  const state = {
+    files: MOCK_FILES.map((f) => Object.assign({}, f)),
+    filter: 'all',
+    query: '',
+    mode: 'trash',
+    busy: false,
+    migrating: new Set(),
+    rules: {
+      watchTemp: true,
+      watchLocal: true,
+      watchRoaming: true,
+      recheck: true,
+      skipLocked: true,
+      ignoreSmall: false
+    },
+    watchingPid: 18492
+  };
+
+  const TOAST_ICON = { success: '🎉', warn: '⚠️', error: '❌', info: '📡', link: '🔗' };
+  const TOAST_ORDER = { error: 4, warn: 3, success: 2, link: 2, info: 1 };
+  const CTA_IDLE_HTML = '<span class="cta-ico">⚡</span><span>一键安全清理</span>';
+  const PILL_TEXT = {
+    safe: '🟢 可安全删除',
+    caution: '🟡 驻留缓存',
+    locked: '🔴 正在占用'
+  };
+
+  const selectedItems = () =>
+    state.files.filter((f) => f.checked && f.category !== 'locked' && !f.symlink_migrated);
+
+  const rowEl = (id) => {
+    const list = $('#fileList');
+    return list ? Array.from(list.children).find((el) => el.dataset.id === id) || null : null;
+  };
+
+  /* ============================================================
+     3. 渲染层
+     ============================================================ */
+  function matchesFilter(f) {
+    return state.filter === 'all' || f.category === state.filter;
+  }
+
+  function matchesQuery(f) {
+    const q = state.query.trim().toLowerCase();
+    if (!q) return true;
+    return (f.path + ' ' + f.description + ' ' + f.source_process + ' ' + f.pid)
+      .toLowerCase()
+      .indexOf(q) !== -1;
+  }
+
+  function procLabel(f) {
+    return f.source_process + (f.process_alive ? ' (PID: ' + f.pid + ')' : ' (已退出)');
+  }
+
+  /** 单行内部结构（锁定态原地替换时复用） */
+  function rowInner(f) {
+    const locked = f.category === 'locked';
+    const migrated = !!f.symlink_migrated;
+    const migrating = state.migrating.has(f.id);
+    const checked = !locked && !migrated && !!f.checked;
+
+    let check;
+    if (locked) {
+      check = '<span class="lock-ico" title="' + esc(f.lock_reason || '文件被占用') + '">🔒</span>';
+    } else if (migrated) {
+      check = '<input class="cb" type="checkbox" disabled aria-label="已迁移，无需清理" />';
+    } else {
+      check = '<input class="cb" type="checkbox" data-id="' + esc(f.id) + '"' +
+        (checked ? ' checked' : '') +
+        ' aria-label="选择 ' + esc(f.path) + '" />';
+    }
+
+    let pill;
+    if (migrated) {
+      pill = '<span class="pill pill-migrated">✅ 已穿透至 E 盘 (不占C盘)</span>';
+    } else {
+      pill = '<span class="pill pill-' + f.category + '">' + PILL_TEXT[f.category] + '</span>';
+    }
+
+    let action = '';
+    if (migrated) {
+      /* 迁移是「搬家」不是「删除」，必须留一条回程路 —— 老面板有「撤销迁移」，
+         换成新界面后不能悄悄少掉这个能力。 */
+      action = '<span class="migrated-note">物理数据位于 E 盘</span>' +
+        '<button type="button" class="link-btn undo-btn" data-action="unmigrate" data-id="' + esc(f.id) + '"' +
+        ' title="删除目录联接，并把数据从 E 盘移回 C 盘原位置">↩ 撤销迁移</button>';
+    } else if (f.category === 'caution' && f.can_symlink) {
+      action = migrating
+        ? '<span class="link-btn busy"><span class="mini-spin spinner" style="width:8px;height:8px;border-width:1.5px"></span><span>正在迁移至 E:\\dsh_escape_cache…</span></span>'
+        : '<button type="button" class="link-btn" data-action="mklink" data-id="' + esc(f.id) + '" title="目录剪切至 E:\\dsh_escape_cache 并建立 mklink /J 联接">🔗 mklink 搬家至E盘</button>';
+    } else if (f.category === 'caution') {
+      /* 后端明确拒绝迁移时，把原因写出来 —— 否则用户只会看到一个没有按钮的
+         🟡 行，误以为界面坏了。 */
+      action = '<span class="migrated-note noreason" title="' + esc(f.symlink_reason || '该目录不满足迁移条件') + '">🚫 ' +
+        esc(f.symlink_reason || '不满足迁移条件') + '</span>';
+    }
+
+    return '' +
+      '<div class="row-check">' + check + '</div>' +
+      '<div class="row-main">' +
+        '<div class="row-path" title="' + esc(f.path) + '">' + esc(f.path) + '</div>' +
+        '<div class="row-desc" title="' + esc(f.description) + '">' + esc(f.description) + '</div>' +
+      '</div>' +
+      '<div class="row-proc"><span class="proc ' + (f.process_alive ? 'alive' : 'dead') + '" title="' + esc(procLabel(f)) + '"><i></i>' + esc(procLabel(f)) + '</span></div>' +
+      '<div class="row-cat">' + pill + '</div>' +
+      '<div class="row-size">' +
+        '<span class="size-val">' + formatSize(f.size_bytes) + '</span>' +
+        action +
+      '</div>';
+  }
+
+  function rowHTML(f) {
+    const cls = ['file-row'];
+    if (f.checked && f.category !== 'locked' && !f.symlink_migrated) cls.push('is-checked');
+    if (f.symlink_migrated) cls.push('is-migrated');
+    if (state.migrating.has(f.id)) cls.push('is-migrating');
+    return '<div class="' + cls.join(' ') + '" data-id="' + esc(f.id) + '" data-cat="' + f.category + '">' +
+      rowInner(f) + '</div>';
+  }
+
+  function renderList(highlightId) {
+    const list = $('#fileList');
+    if (!list) return;
+    const keepTop = list.scrollTop;
+    const visible = state.files.filter((f) => matchesFilter(f) && matchesQuery(f));
+
+    if (!visible.length) {
+      list.innerHTML =
+        '<div class="empty"><div class="empty-ico">🍃</div>' +
+        '<div>当前过滤条件下没有匹配的逃逸文件</div>' +
+        '<div class="empty-sub">试试清空搜索关键词，或切换到「全部」分类</div></div>';
+    } else {
+      list.innerHTML = visible.map(rowHTML).join('');
+    }
+
+    if (highlightId) {
+      list.scrollTop = 0;
+      const row = rowEl(highlightId);
+      if (row) {
+        row.classList.add('row-new');
+        setTimeout(() => row.classList.remove('row-new'), 1700);
+      }
+    } else {
+      list.scrollTop = keepTop;
+    }
+  }
+
+  function totals() {
+    const t = {
+      safe: { bytes: 0, count: 0 },
+      caution: { bytes: 0, count: 0, migratable: 0 },
+      locked: { bytes: 0, count: 0 }
+    };
+    state.files.forEach((f) => {
+      const bucket = t[f.category];
+      if (!bucket) return;
+      bucket.bytes += f.symlink_migrated ? 0 : f.size_bytes;
+      bucket.count += 1;
+      if (f.category === 'caution' && f.can_symlink && !f.symlink_migrated) bucket.migratable += 1;
+    });
+    return t;
+  }
+
+  function updateMetrics() {
+    const t = totals();
+    $('#safeBytes').textContent = formatSize(t.safe.bytes);
+    $('#safeCount').textContent = t.safe.count + ' 项文件';
+    $('#cautionBytes').textContent = formatSize(t.caution.bytes);
+    $('#cautionCount').textContent = t.caution.count + ' 个目录';
+    $('#cautionSub').textContent = '可 mklink 迁移 ' + t.caution.migratable + ' 个目录 · 默认不勾选';
+    $('#lockedBytes').textContent = formatSize(t.locked.bytes);
+    $('#lockedCount').textContent = t.locked.count + ' 项';
+  }
+
+  function updateChips() {
+    const t = totals();
+    $('#countAll').textContent = state.files.length;
+    $('#countSafe').textContent = t.safe.count;
+    $('#countCaution').textContent = t.caution.count;
+    $('#countLocked').textContent = t.locked.count;
+
+    $$('.chip').forEach((chip) => chip.classList.toggle('active', chip.dataset.filter === state.filter));
+    $$('.metric').forEach((card) => card.classList.toggle('is-active', card.dataset.filter === state.filter));
+  }
+
+  function renderMonitors() {
+    const box = $('#monitorList');
+    if (!box) return;
+    const sums = MONITORS.map((m) =>
+      bytesSum(state.files.filter((f) => m.test(f.path) && !f.symlink_migrated))
+    );
+    const max = Math.max.apply(null, sums.concat([1]));
+
+    box.innerHTML = MONITORS.map((m, i) => {
+      const pct = Math.max(4, Math.round((sums[i] / max) * 100));
+      return '<div class="monitor-item ' + m.key + '">' +
+        '<div class="monitor-head">' +
+          '<span class="monitor-name" title="' + esc(m.name) + '">' + esc(m.name) + '</span>' +
+          '<span class="monitor-size">' + formatSize(sums[i]) + '</span>' +
+        '</div>' +
+        '<div class="monitor-hint">' + esc(m.hint) + '</div>' +
+        '<div class="monitor-bar"><i style="width:' + pct + '%"></i></div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function renderEnv() {
+    const box = $('#envList');
+    if (!box) return;
+    box.innerHTML = ENV_VARS.map((e) =>
+      '<label class="env-row">' +
+        '<span class="env-text">' +
+          '<span class="env-label">' + esc(e.label) + '</span>' +
+          '<span class="env-target" title="' + esc(e.target) + '">→ ' + esc(e.target) + '</span>' +
+        '</span>' +
+        '<input class="switch" type="checkbox" data-env="' + e.key + '"' +
+          (e.enabled ? ' checked' : '') + ' aria-label="注入 ' + esc(e.label) + '" />' +
+      '</label>'
+    ).join('');
+  }
+
+  function updateDock() {
+    const sel = selectedItems();
+    const bytes = bytesSum(sel);
+    const locked = state.files.filter((f) => f.category === 'locked').length;
+
+    $('#selCount').textContent = sel.length;
+    $('#selSize').textContent = formatSize(bytes);
+    $('#skipCount').textContent = locked;
+
+    if (!state.busy) {
+      const btn = $('#cleanBtn');
+      btn.disabled = sel.length === 0;
+    }
+  }
+
+  function updateAll() {
+    renderList();
+    updateMetrics();
+    updateChips();
+    renderMonitors();
+    updateDock();
+  }
+
+  /* ============================================================
+     4. Toast
+     ============================================================ */
+  function showToast(html, type, ttl) {
+    const wrap = $('#toasts');
+    if (!wrap) return;
+    const kind = type || 'info';
+    const el = document.createElement('div');
+    el.className = 'toast ' + kind;
+    el.innerHTML = '<span class="ico">' + (TOAST_ICON[kind] || '·') + '</span><div>' + html + '</div>';
+    wrap.appendChild(el);
+
+    while (wrap.children.length > 3) wrap.removeChild(wrap.firstElementChild);
+
+    const life = ttl || (kind === 'warn' ? 5200 : 3800);
+    setTimeout(() => {
+      el.classList.add('out');
+      setTimeout(() => el.remove(), 280);
+    }, life);
+  }
+
+  /* ============================================================
+     5. Bridge：唯一的后端出口
+        - ① pywebview：window.pywebview.api（ui_bridge.py --gui）
+        - ② REST：同源 /api/*（ui_bridge.py --serve）
+        - ③ Mock：上面两种都探测不到时的内置数据
+     ============================================================ */
+  const REST_BASE = 'api/';
+  const hasRest = function () {
+    return location.protocol === 'http:' || location.protocol === 'https:';
+  };
+
+  function hostApi() {
+    const api = window.pywebview && window.pywebview.api;
+    return api || null;
+  }
+
+  async function callRest(name, args) {
+    const res = await fetch(REST_BASE + name, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ args: args || [] })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res.json();
+  }
+
+  /* 统一出口：python 侧方法名（clean / migrate …）与 UI_SPEC §5 的正式名
+     （execute_clean / migrate_to_e_drive_symlink）都试一遍。 */
+  async function callHost(names, args) {
+    const api = hostApi();
+    if (api) {
+      for (let i = 0; i < names.length; i++) {
+        if (typeof api[names[i]] === 'function') return api[names[i]].apply(api, args || []);
+      }
+      return null;
+    }
+    if (hasRest()) {
+      for (let i = 0; i < names.length; i++) {
+        try {
+          return await callRest(names[i], args || []);
+        } catch (e) {
+          if (!/HTTP 404/.test(String(e && e.message))) throw e;
+        }
+      }
+    }
+    return null;
+  }
+
+  const Bridge = {
+    async clean(paths, mode) {
+      const hit = await callHost(['clean', 'execute_clean'], [paths, mode]);
+      if (hit) return hit;
+
+      await sleep(880); // Mock: 瞬时二次句柄校验耗时
+      const cleaned = [];
+      const skipped = [];
+      let freed = 0;
+      paths.forEach((p) => {
+        const f = state.files.find((x) => x.path === p);
+        if (!f) return;
+        if (f._lock_on_clean) {
+          f._lock_on_clean = false;
+          skipped.push({
+            path: p,
+            pid: 24816,
+            reason: 'WinError 32: 文件已被新派生的 python.exe (PID: 24816) 重新占用'
+          });
+        } else {
+          cleaned.push(p);
+          freed += f.size_bytes;
+        }
+      });
+      return { ok: true, cleaned: cleaned, skipped: skipped, freed_bytes: freed, mode: mode };
+    },
+
+    async migrate(path) {
+      const hit = await callHost(['migrate', 'migrate_to_e_drive_symlink'], [path]);
+      if (hit) return hit;
+
+      await sleep(1500); // Mock: 目录剪切 + mklink /J 耗时
+      const f = state.files.find((x) => x.path === path);
+      return {
+        ok: true,
+        target: 'E:\\dsh_escape_cache\\' + baseName(path),
+        bytes_moved: f ? f.size_bytes : 0
+      };
+    },
+
+    /* 撤销迁移：删除目录联接，把数据移回 C 盘原位置。 */
+    async unmigrate(path) {
+      const hit = await callHost(['unmigrate'], [path]);
+      if (hit) return hit;
+
+      await sleep(1200); // Mock: 删除联接 + 数据移回耗时
+      return { ok: true, restored: true, source: path, bytes_moved: 0 };
+    },
+
+    /* 清理过期条目：只删状态库死行，不动磁盘文件。 */
+    async purge() {
+      const hit = await callHost(['purge'], []);
+      if (hit) return hit;
+      await sleep(400);
+      return { ok: true, forgotten: 0, bytes: 0, dead: 0 };
+    },
+
+    async refresh() {
+      const hit = await callHost(['refresh'], []);
+      if (hit) return hit;
+      await sleep(700);
+      return { ok: true, locked: state.files.filter((f) => f.category === 'locked').length };
+    },
+
+    async saveRules(rules) {
+      const hit = await callHost(['saveRules', 'save_rules'], [rules]);
+      if (hit) return hit;
+      await sleep(320);
+      return { ok: true, rules: rules };
+    },
+
+    async setEnv(key, enabled) {
+      const hit = await callHost(['setEnv', 'set_env'], [key, enabled]);
+      if (hit) return hit;
+      await sleep(120);
+      return { ok: true, key: key, enabled: enabled };
+    },
+
+    /* 首帧真实数据。pywebview 与 REST 都拿不到就返回 null，调用方保留 Mock。 */
+    async getState() {
+      return (await callHost(['get_state', 'getState'], [])) || null;
+    }
+  };
+
+  /* 把 Python 快照灌进 state。字段名与 TrackedFileItem（UI_SPEC §5）一一对应，
+     所以这里只做防御性兜底，不做重命名。 */
+  function adoptSnapshot(snap) {
+    if (!snap || !Array.isArray(snap.files)) return false;
+    /* 空列表：只有「权威后端」才允许清空界面。插件后端（panel-ui.js）会带
+       authoritative:true —— 真实库确实可能一条可清理行都没有，此时继续挂着
+       19 条 Mock 是撒谎。内置 Mock / ui_bridge.py 的空数组仍视为无效快照。 */
+    if (!snap.files.length && !snap.authoritative) return false;
+    state.files = snap.files.map((f) => ({
+      id: String(f.id),
+      path: f.path,
+      description: f.description || '',
+      source_process: f.source_process || 'unknown',
+      pid: Number(f.pid) || 0,
+      process_alive: !!f.process_alive,
+      category: f.category || 'safe',
+      size_bytes: Number(f.size_bytes) || 0,
+      checked: !!f.checked,
+      can_symlink: !!f.can_symlink,
+      symlink_reason: f.symlink_reason || '',
+      symlink_target: f.symlink_target || '',
+      symlink_migrated: !!f.symlink_migrated,
+      lock_reason: f.lock_reason || null
+    }));
+    if (Array.isArray(snap.env) && snap.env.length) {
+      const byKey = {};
+      snap.env.forEach((e) => (byKey[e.key] = e));
+      ENV_VARS.forEach((v) => {
+        if (byKey[v.key]) v.enabled = !!byKey[v.key].enabled;
+      });
+    }
+    if (snap.rules && typeof snap.rules === 'object') Object.assign(state.rules, snap.rules);
+    if (snap.watching_pid) {
+      state.watchingPid = snap.watching_pid;
+      const pidEl = $('#watchPid');
+      if (pidEl) pidEl.textContent = snap.watching_pid;
+    }
+    if (snap.dsh_home) state.dshHome = snap.dsh_home;
+    renderDshHome(state.dshHome);
+    return true;
+  }
+
+  /* 头部/侧栏的豁免徽章原先写死 "E:\.dsh"，而本机真实 DSH_HOME 是
+     "E:\dsh\.dsh"（E:\.dsh 压根不存在）。写一个不存在的路径会让人以为
+     配置排除没生效 —— 换成后端回报的真值，拿不到时才退回占位文案。 */
+  function renderDshHome(home) {
+    const badge = $('#exemptBadge');
+    const note = $('#exemptNote');
+    const value = String(home || '').trim();
+    if (!value) return;
+    if (badge) {
+      badge.textContent = '✓ $DSH_HOME = ' + value + ' (已豁免监听)';
+      badge.title = value + ' 不参与扫描，0% 额外开销';
+    }
+    if (note) note.textContent = '✓ ' + value + ' 已自动跳过';
+  }
+
+  /* ui_bridge.py 在窗口 loaded 事件里会主动推一次，避免"先闪 Mock 再换真数据" */
+  window.__CLEANER_HOST__ = function (snap) {
+    if (adoptSnapshot(snap)) {
+      renderEnv();
+      updateAll();
+    }
+  };
+
+  /* ============================================================
+     5b. 实时推送（c_watcher.py → 新文件滑入，UI_SPEC §4.2）
+        - pywebview：后端在 watchdog 线程里 evaluate_js(__CLEANER_PUSH__)
+        - REST：前端定时轮询 /api/poll_events?after=<cursor>
+     两条路的载荷形状完全一致：{items:[TrackedFileItem], cursor, stats}
+     ============================================================ */
+  let pushCursor = 0;
+  let pushSeen = Object.create(null); // id -> true，防同一事件被两条路各播一次动画
+  let liveCount = 0;
+  let livePollTimer = null;
+
+  function adoptLiveItem(raw) {
+    // 后端给的就是 UI_SPEC §5 的字段形状，这里只做防御性补齐（缺字段的
+    // 老版本后端也不该让整行渲染崩掉）。
+    const path = String(raw.path || '');
+    if (!path) return null;
+    const item = {
+      id: raw.id || ('live_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7)),
+      path: path,
+      description: raw.description || ('⚡ 实时捕获 · ' + baseName(path)),
+      source_process: raw.source_process || '未知进程',
+      pid: raw.pid == null ? 0 : raw.pid,
+      process_alive: !!raw.process_alive,
+      category: raw.category === 'locked' || raw.category === 'caution' ? raw.category : 'safe',
+      size_bytes: Number(raw.size_bytes) || 0,
+      checked: raw.category === 'locked' ? false : raw.checked !== false,
+      can_symlink: !!raw.can_symlink,
+      symlink_reason: raw.symlink_reason || '',
+      symlink_target: raw.symlink_target || '',
+      symlink_migrated: !!raw.symlink_migrated,
+      lock_reason: raw.lock_reason || null,
+      _live: true
+    };
+    if (item.category === 'locked') item.checked = false;
+    return item;
+  }
+
+  /* 新行推入：顶部平滑插入 + 1.5s 青色边框呼吸（§4.2）。
+     复用 renderList(highlightId)，它已经负责 scrollTop=0 与 .row-new 的
+     1700ms 回收，动画参数在 CSS 里（.file-row.row-new）。 */
+  function pushLiveItems(rawItems) {
+    if (!Array.isArray(rawItems) || !rawItems.length) return 0;
+    const fresh = [];
+    rawItems.forEach((raw) => {
+      const item = adoptLiveItem(raw);
+      if (!item) return;
+      if (pushSeen[item.id]) return;
+      // 同一个物理路径已经在列表里（被清理后又产生同名文件）就更替而不是叠加
+      const dupIdx = state.files.findIndex((f) => f.path === item.path);
+      if (dupIdx >= 0) {
+        pushSeen[item.id] = true;
+        state.files.splice(dupIdx, 1);
+      }
+      pushSeen[item.id] = true;
+      fresh.push(item);
+    });
+    if (!fresh.length) return 0;
+    if (Object.keys(pushSeen).length > 400) pushSeen = Object.create(null);
+
+    // 当前过滤/搜索会把这些新行藏起来时，先切回「全部」再说 ——
+    // 否则用户点了"🔴 仅看锁定"却收到一条 safe 推送，界面上什么都不动，
+    // 看起来就像后端没连上。
+    const hidden = fresh.some((f) => !(matchesFilter(f) && matchesQuery(f)));
+    if (hidden) {
+      state.filter = 'all';
+      state.query = '';
+      const input = $('#searchInput');
+      if (input) input.value = '';
+    }
+
+    // 倒序 unshift，保证后端给的顺序在界面上也是从新到旧
+    for (let i = fresh.length - 1; i >= 0; i--) state.files.unshift(fresh[i]);
+
+    renderList(fresh[0].id);
+    updateMetrics();
+    updateChips();
+    renderMonitors();
+    updateDock();
+
+    liveCount += fresh.length;
+    const head = fresh[0];
+    updateLiveTag(true);
+    const extra = fresh.length > 1 ? '<span class="dim"> 等 ' + fresh.length + ' 个文件</span>' : '';
+    showToast(
+      '⚡ 捕获到新的 C 盘逃逸写入 <b>' + esc(baseName(head.path)) + '</b>' + extra +
+      '<span class="dim"> +' + formatSize(head.size_bytes) + '</span>' +
+      (hidden ? '<span class="dim">（已切回「全部」视图）</span>' : ''),
+      'info'
+    );
+    return fresh.length;
+  }
+
+  /* pywebview 路径：后端 evaluate_js 直接调 */
+  window.__CLEANER_PUSH__ = function (payload) {
+    if (!payload || payload.ok === false) return 0;
+    if (typeof payload.cursor === 'number' && payload.cursor > pushCursor) pushCursor = payload.cursor;
+    if (payload.stats) applyWatcherStats(payload.stats);
+    return pushLiveItems(payload.items);
+  };
+
+  /* 徽章上的数字取**本次会话推入的条数**（liveCount），不是后端累计器：
+     后端 stats.candidates 是进程自启动以来的总数，界面上会显示成一个跟
+     当前列表毫无关系的大数（例如刚连上就写着 LIVE · 8）。累计值只放 tooltip。 */
+  function applyWatcherStats(stats) {
+    state.watcherStats = stats || {};
+    const tag = $('#liveTag');
+    if (!tag) return;
+    tag.textContent = liveCount > 0 ? ('LIVE · ' + liveCount) : 'LIVE';
+    if (stats) {
+      tag.title = '本次会话已推入 ' + liveCount + ' 条；后端累计候选 ' +
+        Number(stats.candidates || 0) + '，过滤 ' + Number(stats.filtered || 0) +
+        '，句柄归因拒绝 ' + Number(stats.gated || 0);
+    }
+  }
+
+  /* REST 路径：没有长连接，用游标轮询增量。间隔 1.5s —— 后端已有 3s 防抖，
+     再快也拿不到新东西，1.5s 只是让"推入"看起来是实时的。 */
+  /* 连上的第一件事是**对齐游标**：后端缓冲里可能还压着上一轮会话的事件，
+     若直接 poll(0) 会把它们全当成"刚发生的新文件"重播一遍动画 —— 界面会
+     凭空多出几行早已删掉的旧文件。limit=0 是后端的"只给游标、别给历史"。 */
+  async function primeLiveCursor() {
+    if (!hasRest()) return;
+    try {
+      const res = await callRest('poll_events', [0, 0]);
+      if (res && typeof res.cursor === 'number') pushCursor = res.cursor;
+    } catch (e) { /* 拿不到就保持 0，最多重播一轮，不影响主流程 */ }
+  }
+
+  function startLivePolling() {
+    if (livePollTimer || !hasRest()) return;
+    let failures = 0;
+    const tick = async function () {
+      try {
+        const res = await callRest('poll_events', [pushCursor, 50]);
+        failures = 0;
+        if (res && res.ok !== false) {
+          if (typeof res.cursor === 'number' && res.cursor > pushCursor) pushCursor = res.cursor;
+          if (res.stats) applyWatcherStats(res.stats);
+          if (res.enabled === false) {
+            updateLiveTag(false);
+            stopLivePolling();
+            return;
+          }
+          pushLiveItems(res.items);
+        }
+      } catch (e) {
+        failures += 1;
+        // 连续失败 5 次（≈7.5s）才认定后端挂了，单次抖动不打扰用户
+        if (failures >= 5) {
+          stopLivePolling();
+          updateLiveTag(false);
+          showToast('实时推送已断开（' + (e && e.message ? e.message : '网络错误') + '），列表仍可手动刷新', 'warn');
+        }
+      }
+    };
+    tick();
+    livePollTimer = setInterval(tick, 1500);
+  }
+
+  function stopLivePolling() {
+    if (livePollTimer) {
+      clearInterval(livePollTimer);
+      livePollTimer = null;
+    }
+  }
+
+  function updateLiveTag(on) {
+    const tag = $('#liveTag');
+    if (!tag) return;
+    tag.textContent = on && liveCount > 0 ? ('LIVE · ' + liveCount) : 'LIVE';
+    tag.classList.toggle('is-off', !on);
+    tag.title = on ? '实时监听中：C 盘逃逸写入会即时推入列表' : '实时监听未启用（后端以 --no-watch 启动或 watchdog 不可用）';
+  }
+
+  /* ============================================================
+     6. 交互：勾选 / 过滤 / 搜索
+     ============================================================ */
+  function toggleCheck(id, checked) {
+    const f = state.files.find((x) => x.id === id);
+    if (!f || f.category === 'locked' || f.symlink_migrated) return;
+    f.checked = !!checked;
+    const row = rowEl(id);
+    if (row) row.classList.toggle('is-checked', f.checked);
+    updateDock(); // 毫秒级实时重算（UI_SPEC §4.1）
+  }
+
+  function setFilter(filter) {
+    state.filter = state.filter === filter && filter !== 'all' ? 'all' : filter;
+    updateChips();
+    renderList();
+  }
+
+  function resetScrollAndRender() {
+    renderList();
+  }
+
+  /* ============================================================
+     7. 一键安全清理（UI_SPEC §4.3）
+     ============================================================ */
+  function applyLockedState(item, reason, pid, row) {
+    item.category = 'locked';
+    item.checked = false;
+    item.process_alive = true;
+    item.lock_reason = reason;
+    item._lock_on_clean = false;
+    if (pid) item.pid = pid;
+    item.description = '⚠️ ' + reason;
+
+    if (!row) return;
+    row.dataset.cat = 'locked';
+    row.classList.remove('is-checked', 'row-exit', 'row-new', 'is-migrating');
+    row.classList.add('just-locked');
+    row.innerHTML = rowInner(item);
+    setTimeout(() => row.classList.remove('just-locked'), 1200);
+  }
+
+  async function runClean() {
+    if (state.busy) return;
+
+    const sel = selectedItems();
+    if (!sel.length) {
+      showToast('当前没有勾选任何可清理文件，请先勾选 🟢 / 🟡 行', 'warn');
+      return;
+    }
+
+    state.busy = true;
+    const btn = $('#cleanBtn');
+    btn.disabled = true;
+    btn.classList.add('is-busy');
+    btn.innerHTML = '<span class="spinner"></span><span>正在瞬时二次校验文件句柄...</span>';
+
+    const paths = sel.map((f) => f.path);
+    const modeLabel = state.mode === 'trash' ? '移入回收站' : '物理抹除';
+
+    try {
+      const res = await Bridge.clean(paths, state.mode);
+      if (!res || res.ok === false) throw new Error((res && res.error) || '后端返回失败');
+
+      const cleanedSet = new Set(res.cleaned || paths);
+      const skippedList = res.skipped || [];
+      const skippedMap = new Map(skippedList.map((s) => [s.path, s]));
+      const removedIds = [];
+
+      for (const item of sel) {
+        const skip = skippedMap.get(item.path);
+        if (skip) {
+          applyLockedState(item, skip.reason || 'WinError 32: 句柄被占用', skip.pid, rowEl(item.id));
+          showToast(
+            '已跳过 <b>' + esc(baseName(item.path)) + '</b>：' + esc(skip.reason || '句柄被占用'),
+            'warn'
+          );
+          continue;
+        }
+        if (!cleanedSet.has(item.path)) continue;
+
+        removedIds.push(item.id);
+        const row = rowEl(item.id);
+        if (row) row.classList.add('row-exit');
+        await sleep(65); // 级联滑出
+      }
+
+      await sleep(340);
+
+      let freed = 0;
+      if (typeof res.freed_bytes === 'number') {
+        freed = res.freed_bytes;
+      } else {
+        freed = bytesSum(state.files.filter((f) => removedIds.indexOf(f.id) !== -1));
+      }
+      state.files = state.files.filter((f) => removedIds.indexOf(f.id) === -1);
+
+      if (removedIds.length === 0) {
+        showToast('全部文件在二次校验时被占用，本次未释放任何空间', 'warn');
+      } else {
+        showToast(
+          '已安全释放 <b>' + formatSize(freed) + '</b> C盘空间' +
+          '<span class="dim">（' + removedIds.length + ' 项 · ' + modeLabel + '）</span>',
+          'success'
+        );
+      }
+    } catch (err) {
+      showToast('清理失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    } finally {
+      state.busy = false;
+      btn.classList.remove('is-busy');
+      btn.innerHTML = CTA_IDLE_HTML;
+      btn.disabled = selectedItems().length === 0;
+      updateAll();
+    }
+  }
+
+  /* ============================================================
+     8. mklink 软链接搬家（UI_SPEC §4.4）
+     ============================================================ */
+  async function migrateItem(id) {
+    const f = state.files.find((x) => x.id === id);
+    if (!f || f.symlink_migrated || state.migrating.has(id) || state.busy) return;
+
+    const originalPath = f.path;
+    state.migrating.add(id);
+    renderList();
+
+    try {
+      const res = await Bridge.migrate(originalPath);
+      if (!res || res.ok === false) throw new Error((res && res.error) || '迁移失败');
+
+      const target = res.target || 'E:\\dsh_escape_cache\\' + baseName(originalPath);
+      const moved = typeof res.bytes_moved === 'number' ? res.bytes_moved : f.size_bytes;
+
+      f.symlink_migrated = true;
+      f.checked = false;
+      f.size_bytes = 0;
+      f.can_symlink = false;
+      f.description = '已剪切至 ' + target + ' 并建立 mklink /J 目录联接，C 盘仅保留入口';
+
+      showToast(
+        '已迁移 <b>' + esc(baseName(originalPath)) + '</b> 至 E 盘，C 盘释放 <b>' + formatSize(moved) + '</b>',
+        'link'
+      );
+    } catch (err) {
+      showToast('迁移失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    } finally {
+      state.migrating.delete(id);
+      updateAll();
+    }
+  }
+
+  /* 撤销迁移：与 migrateItem 对称 —— 失败就保持原状并如实报错，成功后行回到 🟡 可迁移态。 */
+  async function unmigrateItem(id) {
+    const f = state.files.find((x) => x.id === id);
+    if (!f || !f.symlink_migrated || state.migrating.has(id) || state.busy) return;
+
+    state.migrating.add(id);
+    renderList();
+
+    try {
+      const res = await Bridge.unmigrate(f.path);
+      if (!res || res.ok === false) throw new Error((res && res.error) || '撤销失败');
+
+      /* 本地只改「已迁移」这一个布尔是不够的：can_symlink / symlink_reason /
+         size_bytes 都是迁移态的残留值，不重拉就会渲染成「0 MB 🚫 已迁移至 E 盘」。
+         后端才是权威，撤销成功后直接重新拉取快照。 */
+      const snap = await Bridge.getState();
+      if (snap && adoptSnapshot(snap)) {
+        renderEnv();
+      } else {
+        f.symlink_migrated = false;
+        f.can_symlink = true;
+        f.symlink_reason = '';
+        f.size_bytes = Number(res.bytes_moved) || 0;
+      }
+
+      showToast('已撤销 <b>' + esc(baseName(f.path)) + '</b> 的迁移，数据已移回 C 盘', 'link');
+    } catch (err) {
+      showToast('撤销失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    } finally {
+      state.migrating.delete(id);
+      updateAll();
+    }
+  }
+
+  /* ============================================================
+     9. 实时推送 / 刷新 / 规则 / 环境变量
+     ============================================================ */
+  // 注意：这里给 Mock 演示用的模板游标单独命名。早先它也叫 pushCursor，
+  // 会和上面实时推送的事件游标撞车，导致 Mock 推送一按就把增量游标打乱。
+  let simPushCursor = 0;
+
+  function simulatePush() {
+    const tpl = PUSH_POOL[simPushCursor % PUSH_POOL.length];
+    simPushCursor += 1;
+
+    const item = {
+      id: 'file_live_' + Date.now().toString(36),
+      path: tpl.path,
+      description: tpl.description,
+      source_process: tpl.source_process,
+      pid: tpl.pid,
+      process_alive: false,
+      category: 'safe',
+      size_bytes: mb(tpl.size),
+      checked: true,
+      can_symlink: false,
+      symlink_migrated: false,
+      lock_reason: null
+    };
+
+    const wasHidden = !(matchesFilter(item) && matchesQuery(item));
+    if (wasHidden) {
+      state.filter = 'all';
+      state.query = '';
+      const input = $('#searchInput');
+      if (input) input.value = '';
+    }
+
+    state.files.unshift(item);
+
+    // 平滑插入列表顶部 + 1.5s 青色边框呼吸（UI_SPEC §4.2）
+    renderList(item.id);
+    updateMetrics();
+    updateChips();
+    renderMonitors();
+    updateDock();
+
+    showToast(
+      '捕获到新的 C 盘逃逸写入 <b>' + esc(baseName(item.path)) + '</b>' +
+      '<span class="dim"> +' + formatSize(item.size_bytes) + '</span>' +
+      (wasHidden ? '<span class="dim">（已切回「全部」视图）</span>' : ''),
+      'info'
+    );
+  }
+
+  async function refreshHandles() {
+    if (state.busy) return;
+    const btn = $('#refreshBtn');
+    const ico = $('#refreshIco');
+    btn.disabled = true;
+    ico.classList.add('spinning');
+    try {
+      await Bridge.refresh();
+      updateAll();
+      const locked = state.files.filter((f) => f.category === 'locked').length;
+      showToast(
+        '句柄状态已刷新：<b>' + locked + '</b> 个文件占用中，<b>' +
+        (state.files.length - locked) + '</b> 项可释放',
+        'info'
+      );
+    } catch (err) {
+      showToast('刷新失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    } finally {
+      btn.disabled = false;
+      ico.classList.remove('spinning');
+    }
+  }
+
+  /* 清理过期条目：只清状态库死行（文件已不存在的跟踪记录），绝不碰磁盘文件。
+     老面板有这个按钮，换界面后不能悄悄少掉 —— 否则死行会一直占着列表，
+     点清理时又永远失败。 */
+  async function purgeStale() {
+    if (state.busy) return;
+    const btn = $('#purgeBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await Bridge.purge();
+      if (!res || res.ok === false) throw new Error((res && res.error) || '清理过期条目失败');
+
+      const snap = await Bridge.getState();
+      if (snap && adoptSnapshot(snap)) renderEnv();
+      updateAll();
+
+      const n = Number(res.forgotten) || 0;
+      showToast(
+        n > 0
+          ? '已清理 <b>' + n + '</b> 条过期跟踪记录<span class="dim">（只清记录，未动磁盘文件）</span>'
+          : '没有过期条目需要清理',
+        n > 0 ? 'success' : 'info'
+      );
+    } catch (err) {
+      showToast('清理过期条目失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function openRules() {
+    syncRulesUI();
+    $('#rulesModal').hidden = false;
+  }
+
+  function closeRules() {
+    $('#rulesModal').hidden = true;
+  }
+
+  function syncRulesUI() {
+    $$('#rulesModal [data-rule]').forEach((input) => {
+      const key = input.dataset.rule;
+      input.checked = !!state.rules[key];
+    });
+  }
+
+  async function saveRules() {
+    try {
+      await Bridge.saveRules(Object.assign({}, state.rules));
+      closeRules();
+      showToast('规则已保存<span class="dim">（Mock 模式：接后端后写入 config.json）</span>', 'success');
+    } catch (err) {
+      showToast('保存失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+    }
+  }
+
+  function resetMock() {
+    if (state.busy) return;
+    /* 接上真后端后，这个按钮不再是「恢复假数据」，而是「重新拉取」——
+       否则用户点一下就把真实列表换成 19 条 Mock，是纯倒退。 */
+    if (state.hostLinked) {
+      closeRules();
+      showToast('正在重新拉取后端数据…', 'info');
+      Bridge.getState()
+        .then((snap) => {
+          if (!adoptSnapshot(snap)) return;
+          renderEnv();
+          updateAll();
+          showToast('已重新拉取 · 当前 ' + state.files.length + ' 项', 'success');
+        })
+        .catch((err) => {
+          showToast('拉取失败：' + esc(err && err.message ? err.message : String(err)), 'error');
+        });
+      return;
+    }
+    state.files = MOCK_FILES.map((f) => Object.assign({}, f));
+    state.filter = 'all';
+    state.query = '';
+    state.migrating.clear();
+    state.mode = 'trash';
+    const input = $('#searchInput');
+    if (input) input.value = '';
+    $$('.mode-btn').forEach((b) => b.classList.toggle('active', b.dataset.mode === 'trash'));
+    setModeLabel('trash');
+    closeRules();
+    updateAll();
+    showToast('已重置为初始 Mock 数据', 'info');
+  }
+
+  function setModeLabel(mode) {
+    const wipe = mode === 'wipe';
+    const el = $('#modeText');
+    if (!el) return;
+    el.textContent = wipe ? '🔥 直接物理抹除（不可恢复）' : '🛡️ 移入系统回收站 (send2trash)';
+    el.classList.toggle('danger', wipe);
+  }
+
+  function setMode(mode) {
+    if (state.busy) return;
+    state.mode = mode;
+    $$('.mode-btn').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    setModeLabel(mode);
+    showToast(
+      mode === 'wipe'
+        ? '已切换为 🔥 直接物理抹除，删除后不可恢复'
+        : '已切换为 🛡️ 移入系统回收站（可恢复）',
+      mode === 'wipe' ? 'warn' : 'info'
+    );
+  }
+
+  function onEnvToggle(key, enabled) {
+    const env = ENV_VARS.find((e) => e.key === key);
+    if (!env) return;
+    env.enabled = enabled;
+    Bridge.setEnv(key, enabled);
+    showToast(
+      enabled
+        ? '已注入 <b>' + esc(env.label) + '</b> → <span class="mono">' + esc(env.target) + '</span>'
+        : '已停止注入 <b>' + esc(env.label) + '</b>',
+      enabled ? 'success' : 'info'
+    );
+  }
+
+  /* ============================================================
+     10. 事件绑定
+     ============================================================ */
+  function bindEvents() {
+    // 列表：勾选 / mklink
+    const list = $('#fileList');
+    list.addEventListener('change', (e) => {
+      const cb = e.target.closest('input.cb[data-id]');
+      if (cb) toggleCheck(cb.dataset.id, cb.checked);
+    });
+    list.addEventListener('click', (e) => {
+      const link = e.target.closest('[data-action="mklink"]');
+      if (link) { migrateItem(link.dataset.id); return; }
+      const undo = e.target.closest('[data-action="unmigrate"]');
+      if (undo) unmigrateItem(undo.dataset.id);
+    });
+
+    // 过滤 chips
+    $('#filterChips').addEventListener('click', (e) => {
+      const chip = e.target.closest('.chip');
+      if (chip) setFilter(chip.dataset.filter);
+    });
+
+    // 指标卡
+    $('#metrics').addEventListener('click', (e) => {
+      const card = e.target.closest('.metric');
+      if (card) setFilter(card.dataset.filter);
+    });
+
+    // 搜索（按文件名 / 进程 / PID）
+    let searchTimer = null;
+    $('#searchInput').addEventListener('input', (e) => {
+      state.query = e.target.value;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(resetScrollAndRender, 110);
+    });
+
+    // 底部
+    $('#cleanBtn').addEventListener('click', runClean);
+    $('.mode-switch').addEventListener('click', (e) => {
+      const btn = e.target.closest('.mode-btn');
+      if (btn) setMode(btn.dataset.mode);
+    });
+
+    // 顶栏
+    $('#refreshBtn').addEventListener('click', refreshHandles);
+    $('#rulesBtn').addEventListener('click', openRules);
+    $('#simulateBtn').addEventListener('click', simulatePush);
+    $('#purgeBtn').addEventListener('click', purgeStale);
+
+    // 环境变量劫持
+    $('#envList').addEventListener('change', (e) => {
+      const sw = e.target.closest('input[data-env]');
+      if (sw) onEnvToggle(sw.dataset.env, sw.checked);
+    });
+
+    // 规则弹窗
+    $('#rulesModal').addEventListener('click', (e) => {
+      if (e.target.closest('[data-close]')) { closeRules(); return; }
+      if (e.target.id === 'rulesModal') { closeRules(); return; }
+      if (e.target.closest('#saveRulesBtn')) { saveRules(); return; }
+      if (e.target.closest('#resetBtn')) { resetMock(); }
+    });
+    $('#rulesModal').addEventListener('change', (e) => {
+      const input = e.target.closest('input[data-rule]');
+      if (input) state.rules[input.dataset.rule] = input.checked;
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !$('#rulesModal').hidden) closeRules();
+    });
+  }
+
+  /* ============================================================
+     11. 启动
+     ============================================================ */
+  function init() {
+    $('#watchPid').textContent = state.watchingPid;
+    renderEnv();
+    bindEvents();
+    updateAll();
+    setModeLabel(state.mode);
+
+    setTimeout(() => {
+      showToast('已接管 dsh 进程树监控 · E:\\.dsh 已豁免，仅追踪 C 盘逃逸写入', 'success', 4200);
+    }, 650);
+
+    /* 若后端在线（pywebview 或 REST），用真实快照覆盖内置 Mock。
+       拿不到就什么都不做，界面继续跑 Mock —— 绝不因为后端缺席而白屏。
+       pywebview 的 window.pywebview 是**异步注入**的（窗口加载完才出现），
+       init() 跑的时候它可能还不存在，所以下面再挂一个 pywebviewready 监听。 */
+    /* pywebview 的 window.pywebview 注入时机不保证早于本脚本，pywebviewready
+       也可能已经错过，所以这里做**有上限的轮询**：连上就停，连不上就一直跑
+       Mock。纯 file:// 直开（无后端）时轮询 15 秒后自然放弃，不打扰用户。 */
+    if (!connectBackend()) {
+      let tries = 0;
+      const timer = setInterval(function () {
+        tries += 1;
+        if (connectBackend() || tries > 75) clearInterval(timer);
+      }, 200);
+      window.addEventListener('pywebviewready', function () {
+        clearInterval(timer);
+        connectBackend();
+      }, { once: true });
+    }
+  }
+
+  let backendLinked = false;
+
+  /* 接上真后端后，两个「Mock 专用」入口必须退场，否则会误导用户：
+     - 📡 模拟推送 只往列表里塞假数据，真监听已经在推了；
+     - ↺ 重置 Mock 数据 会把真实列表换回 19 条假数据。
+     保留它们但改语义：按钮隐藏，重置按钮文案改成「重新拉取」。 */
+  function enterLiveMode(snap) {
+    const sim = $('#simulateBtn');
+    if (sim) sim.hidden = true;
+    /* 「清理过期条目」只在真后端下有意义 —— Mock 数据里没有死行。 */
+    const purge = $('#purgeBtn');
+    if (purge) purge.hidden = false;
+    const reset = $('#resetBtn');
+    if (reset) {
+      reset.textContent = '↺ 重新拉取后端数据';
+      reset.dataset.live = '1';
+    }
+  }
+
+  function connectBackend() {
+    if (backendLinked) return true;
+    if (!hostApi() && !hasRest()) return false;
+    backendLinked = true;
+    state.hostLinked = true;
+    Bridge.getState()
+      .then((snap) => {
+        if (!adoptSnapshot(snap)) return;
+        enterLiveMode(snap);
+        renderEnv();
+        updateAll();
+        showToast(
+          '已连接插件后端 · 实时数据 ' + state.files.length + ' 项（' + (snap.served_by || 'panel-ui.js') + '）',
+          'success',
+          3800
+        );
+        // 实时监听状态：后端 get_state 里带 watcher 段（旧版后端没有，按关闭处理）
+        const w = snap && snap.watcher;
+        const watching = !!(w && w.enabled);
+        updateLiveTag(watching);
+        if (w && w.stats) applyWatcherStats(w.stats);
+        if (watching) primeLiveCursor().then(startLivePolling);
+      })
+      .catch((err) => {
+        showToast('后端连接失败，已回落到内置 Mock 数据：' + (err && err.message ? err.message : err), 'warn', 5200);
+      });
+    return true;
+  }
+
+  init();
+
+  // 调试句柄：方便在控制台验证状态机
+  window.__CLEANER_UI__ = { state: state, render: updateAll, Bridge: Bridge };
+})();
+</script>
+</body>
+</html>

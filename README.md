@@ -134,6 +134,44 @@ The panel's own transport uses the page's directory base rather than an origin-r
 404s behind a reverse-proxy directory. In the desktop shell the page is `dsh-app://app/` and the
 shell's protocol handler forwards non-module paths to the Host same-origin.
 
+### The glass panel (`/c-cleaner/ui`)
+
+The React `main`-slot panel above is one of **two** renderings, and the second one is the one
+worth looking at. `c-clean ui` also opens the **glass panel** at
+`http://127.0.0.1:3080/c-cleaner/ui/index.html` — a self-contained document (2650 lines, zero
+external requests, no CDN, no framework) served by the plugin itself:
+
+| Endpoint | Method | Returns |
+| --- | --- | --- |
+| `/c-cleaner/ui/api/get_state` | POST | the full snapshot: env groups, watch roots, tier rows |
+| `/c-cleaner/ui/api/clean` | POST | flat `{ok, cleaned, skipped, freed_bytes}` |
+| `/c-cleaner/ui/api/migrate` | POST | `{ok, target, bytes_moved}` — junction to E: |
+| `/c-cleaner/ui/api/unmigrate` | POST | reverses a recorded migration |
+| `/c-cleaner/ui/api/poll_events` | POST | `{cursor, events}` — the ⚡ 实时捕获 live channel |
+
+It is served as-is instead of being rewritten as React components, because a 2500-line
+already-verified interface ported by hand is guaranteed visual drift. `lib/panel-ui.js` registers
+the route on a **second prefix** (`/c-cleaner/ui`, longest-prefix-wins over the existing
+`/c-cleaner/api`) and translates its flat dialect into this plugin's own `{ok, value}` envelope
+and category names — the document itself needed no edit, since its `REST_BASE='api/'` is a
+relative path the browser resolves against the document's own directory.
+
+Two panel-specific behaviours are deliberate and load-bearing
+(`lib/panel-snapshot.js`):
+
+1. **CAUTION rows aggregate one directory each.** `findCandidates` groups by `path.dirname`, which
+   turns `uv-cache/wheels/<1000 .whl>` into 1000 rows that each refuse to migrate. The panel groups
+   by *the first directory under a watch root* instead, so one 🟡 row == one migratable directory.
+2. **Paths are printed in their C: spelling, never resolved through a junction.** A migrated
+   directory is a reparse point on C: pointing at E:; `realpath` would print the E: path and
+   destroy the one fact the row exists to convey — "already tunneled, but still occupying its C:
+   slot".
+
+The live channel is a bounded ring buffer (`LIVE_BUFFER_MAX = 500`, `index.js`), not an unbounded
+log: the panel only ever asks for events **newer** than its last cursor, and a long-idle session
+must not grow it without limit. Rows are pushed to the buffer *before* any `autoClean` can remove
+the file, so the panel shows the capture even when the file is gone a moment later.
+
 ## How the env hijack actually works (the load-bearing detail)
 
 The PRD's premise is "`$DSH_HOME` already moved to E:, so only C-drive *escape* writes remain".
@@ -289,6 +327,9 @@ lib/state-db.js           StateDB over node:sqlite (+ migrations journal)
 lib/symlink-migrate.js    Phase 3: inspectDirectory / migrateDirectory / undoMigration / junction
 lib/session-hook.js       Phase 3: post_session_close -> `session/disposed` silent clean
 lib/commands.js           registerCommands: c-clean status|ui|now|migrate|unmigrate
+lib/panel-snapshot.js     tracked_files rows -> the panel's TrackedFileItem[] (CAUTION dir aggregation)
+lib/panel-ui.js           serves ui/index.html at /c-cleaner/ui and adapts its REST dialect
+ui/index.html             the glass panel document (self-contained, no external requests)
 test/run.js               dependency-free acceptance + adversarial harness
 test/_env-propagation.mjs proves the hijack reaches real children
 CONTRACTS.md              frozen interface contract the modules were built against
