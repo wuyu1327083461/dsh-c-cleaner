@@ -282,79 +282,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const CATEGORY_ORDER = ['SAFE_TO_DELETE', 'CAUTION_CACHE', 'LOCKED_CRITICAL'];
-    const TIER_CLASS = {
-      SAFE_TO_DELETE: 'ccl-tier-safe',
-      CAUTION_CACHE: 'ccl-tier-caution',
-      LOCKED_CRITICAL: 'ccl-tier-locked',
-    };
-    const TIER_KEY = {
-      SAFE_TO_DELETE: 'summary.safe',
-      CAUTION_CACHE: 'summary.caution',
-      LOCKED_CRITICAL: 'summary.locked',
-    };
-    /* Rows rendered per tier before the user asks for more. A real profile measured 18 809
-     * rows; mounting a `<tr>` for each froze the panel, and every busy toggle re-rendered the
-     * lot. The window only limits what is DRAWN — 全选可清理项 / one-click clean still act on
-     * the whole tier, so paging can never make a clean less complete. */
-    const TIER_PAGE = 200;
-
-    // --- styles -----------------------------------------------------------------
-    // Rendered as a React element so unmounting removes them, and every colour is a
-    // theme token, so light/dark switching needs no work from this plugin.
-    const CSS = `
-.ccl-root{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5}
-.ccl-head{padding:16px 20px 12px;border-bottom:1px solid var(--dsw-alias-border-l2)}
-.ccl-title{margin:0;font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary)}
-.ccl-sub{margin:2px 0 0;color:var(--dsw-alias-label-tertiary);font-size:12px}
-.ccl-status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
-.ccl-pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);font-size:12px;color:var(--dsw-alias-label-secondary)}
-.ccl-pill-ok{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
-.ccl-pill-warn{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
-.ccl-pill-err{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
-.ccl-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
-.ccl-summary{display:flex;flex-wrap:wrap;gap:16px;padding:10px 20px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
-.ccl-stat{display:flex;align-items:baseline;gap:6px}
-.ccl-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.ccl-dot-safe{background:var(--dsw-alias-state-success-primary)}
-.ccl-dot-caution{background:var(--dsw-alias-state-warn-primary)}
-.ccl-dot-locked{background:var(--dsw-alias-state-error-primary)}
-.ccl-stat-label{color:var(--dsw-alias-label-secondary)}
-.ccl-stat-value{font-weight:600;color:var(--dsw-alias-label-primary)}
-.ccl-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 20px;border-bottom:1px solid var(--dsw-alias-border-l1)}
-.ccl-btn{appearance:none;border:1px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit}
-.ccl-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-3);border-color:var(--dsw-alias-border-l4)}
-.ccl-btn:disabled{opacity:.5;cursor:default}
-.ccl-btn-primary{background:var(--dsw-alias-button-primary-fill);border-color:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground);font-weight:500}
-.ccl-btn-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover);border-color:var(--dsw-alias-button-primary-hover);filter:none}
-.ccl-spacer{flex:1 1 auto}
-.ccl-check{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer}
-.ccl-body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 0 8px}
-.ccl-group{margin-top:12px}
-.ccl-group-head{display:flex;align-items:center;gap:8px;padding:6px 20px;position:sticky;top:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:600;border-bottom:1px solid var(--dsw-alias-border-l1)}
-.ccl-group-note{margin-left:auto;font-weight:400;color:var(--dsw-alias-label-tertiary)}
-.ccl-table{width:100%;border-collapse:collapse;table-layout:fixed}
-.ccl-table th{text-align:left;font-weight:500;color:var(--dsw-alias-label-tertiary);font-size:11px;padding:6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1)}
-.ccl-table td{padding:5px 8px;border-bottom:1px solid var(--dsw-alias-border-l1);vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ccl-row:hover td{background:var(--dsw-alias-bg-layer-1)}
-.ccl-row-locked td{color:var(--dsw-alias-label-tertiary)}
-.ccl-path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;direction:rtl;text-align:left}
-.ccl-num{text-align:right;font-variant-numeric:tabular-nums}
-.ccl-note{padding:12px 20px;color:var(--dsw-alias-label-tertiary)}
-.ccl-btn-more{margin:8px 0 12px 20px;font-size:11px}
-.ccl-foot{border-top:1px solid var(--dsw-alias-border-l1);padding:8px 20px;color:var(--dsw-alias-label-tertiary);font-size:11px;display:flex;gap:12px;flex-wrap:wrap}
-.ccl-result{margin-left:auto;color:var(--dsw-alias-label-secondary)}
-.ccl-migrate{border-bottom:1px solid var(--dsw-alias-border-l1);padding:10px 20px 12px;background:var(--dsw-alias-bg-layer-1)}
-.ccl-migrate-head{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
-.ccl-migrate-sub{margin:2px 0 8px;font-size:11px;color:var(--dsw-alias-label-tertiary)}
-.ccl-migrate-warn{margin:6px 0;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary);font-size:11px}
-.ccl-migrate-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px}
-.ccl-migrate-note{margin-left:auto;color:var(--dsw-alias-label-tertiary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
-.ccl-migrate-ok{color:var(--dsw-alias-state-success-primary)}
-.ccl-migrate-hint{margin-top:8px;font-size:10px;color:var(--dsw-alias-label-tertiary)}
-`;
-
-    // --- icon -------------------------------------------------------------------
+    // --- panel ------------------------------------------------------------------
     /**
      * Sidebar glyph: a drive platter with an escape arrow and a delete tick, echoing
      * the bundle icon. `currentColor` lets the sidebar own the active/idle colour.
@@ -383,609 +311,65 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // --- panel ------------------------------------------------------------------
-    /** One selectable table row. Locked rows render but refuse selection (PRD 3.3). */
-    function Row(props) {
-      const { row, checked, onToggle, selectable, t } = props;
-      const locked = row.category === 'LOCKED_CRITICAL';
-      const holder = row.locked_by_pid
-        ? `${row.source_process || '?'} : ${row.locked_by_pid}`
-        : locked
-          ? t('tier.locked')
-          : '—';
-      return h(
-        'tr',
-        { className: `ccl-row${locked ? ' ccl-row-locked' : ''}` },
-        h(
-          'td',
-          { style: { width: '34px' } },
-          h('input', {
-            type: 'checkbox',
-            checked: !!checked,
-            disabled: !selectable,
-            'aria-label': row.file_path,
-            onChange: () => onToggle(row.file_path),
-          }),
-        ),
-        h('td', { className: 'ccl-path', title: row.file_path }, row.file_path),
-        h('td', { className: 'ccl-num', style: { width: '80px' } }, formatBytes(row.file_size)),
-        h('td', { style: { width: '150px', color: 'var(--dsw-alias-label-tertiary)' } }, formatTime(row.last_checked_at)),
-        h('td', { style: { width: '160px' } }, holder),
-      );
-    }
-
-    function TierGroup(props) {
-      const { category, rows, selected, onToggle, t } = props;
-      const total = rows.reduce((sum, r) => sum + (Number(r.file_size) || 0), 0);
-      const locked = category === 'LOCKED_CRITICAL';
-      /* Rendering every row is not viable: a real profile measured 18 809 tracked rows, and a
-       * `<tr>` per row (~5 cells, a checkbox each) froze the panel on every click because each
-       * `setBusy(true)` re-rendered all of them. Show a window and let the user ask for more —
-       * the selection buttons still act on the WHOLE tier, not just what is visible. */
-      const [shown, setShown] = useState(TIER_PAGE);
-      const visible = rows.length > shown ? rows.slice(0, shown) : rows;
-      const hidden = rows.length - visible.length;
-      const note = locked
-        ? 'PRD 3.3 — never deleted; the holding process is shown'
-        : category === 'CAUTION_CACHE'
-          ? 'PRD 3.3 — deleting is safe but requires a re-download'
-          : 'PRD 3.3 — not locked and provably disposable';
-      return h(
-        'div',
-        { className: 'ccl-group' },
-        h(
-          'div',
-          { className: 'ccl-group-head' },
-          h('span', { className: `ccl-dot ccl-dot-${locked ? 'locked' : category === 'CAUTION_CACHE' ? 'caution' : 'safe'}` }),
-          h('span', null, `${t(TIER_KEY[category])} · ${rows.length} · ${formatBytes(total)}`),
-          h('span', { className: 'ccl-group-note' }, note),
-        ),
-        rows.length === 0
-          ? h('div', { className: 'ccl-note' }, t('table.none'))
-          : h(
-              'table',
-              { className: 'ccl-table' },
-              h(
-                'thead',
-                null,
-                h(
-                  'tr',
-                  null,
-                  h('th', { style: { width: '34px' } }, ''),
-                  h('th', null, t('col.path')),
-                  h('th', { className: 'ccl-num', style: { width: '80px' } }, t('col.size')),
-                  h('th', { style: { width: '150px' } }, t('col.modified')),
-                  h('th', { style: { width: '160px' } }, t('col.holder')),
-                ),
-              ),
-              h(
-                'tbody',
-                null,
-                visible.map((row) =>
-                  h(Row, {
-                    key: row.file_path,
-                    row,
-                    checked: selected.has(row.file_path),
-                    onToggle,
-                    selectable: !locked,
-                    t,
-                  }),
-                ),
-              ),
-            ),
-        hidden > 0
-          ? h(
-              'div',
-              { className: 'ccl-note' },
-              h(
-                'button',
-                {
-                  className: 'ccl-btn ccl-btn-more',
-                  onClick: () => setShown((n) => n + TIER_PAGE),
-                },
-                t('table.more', { n: hidden }),
-              ),
-            )
-          : null,
-      );
-    }
-
-    /**
-     * PRD §3.4 / §4 — the junction-migration section.
+    /*
+     * The panel is the glass UI (`ui/index.html`, served by this plugin's own `/c-cleaner/ui`
+     * route) rendered in an iframe — deliberately NOT a React re-implementation of it.
      *
-     * Two things are shown, in the order the user acts on them:
-     *   1. candidate directories the SERVER says are eligible right now (it runs the same gate
-     *      the POST does, so nothing here can be refused on click);
-     *   2. migrations that never finished (`PENDING`/`MOVED`), which are the only rows that need
-     *      attention — a crash mid-move leaves the data at the target and no junction behind.
+     * That document is ~2 500 lines of hand-tuned glass styling: aurora blobs, backdrop blur,
+     * tier pills, the one-click clean cascade, the live-slide-in animation, the mklink state
+     * machine. It was verified row by row in a browser. A React port would drift visually and
+     * would have to re-implement every animation, so the document is shipped as-is and framed.
      *
-     * Every action goes through the API; this component never touches a path itself.
+     * Same-origin by construction: `hostRouteUrl` resolves against `document.baseURI`, so the
+     * framed document shares this page's origin. Its relative `fetch('api/<verb>')` calls
+     * therefore land on `/c-cleaner/ui/api/<verb>` — the adapter in `lib/panel-ui.js`, which
+     * speaks the document's flat dialect and translates it onto this plugin's `{ok, value}` API.
+     * Same origin also means no `frame-ancestors`/CSP obstacle and the request passes the fence.
      */
-    function MigrateSection(props) {
-      const { migrations, candidateCount, targetRoot, busy, migration, onMigrate, onUndo, minBytes, t } = props;
-      const candidates = Array.isArray(migrations?.candidates) ? migrations.candidates : [];
-      const interrupted = Array.isArray(migrations?.interrupted) ? migrations.interrupted : [];
-      const history = Array.isArray(migrations?.history) ? migrations.history : [];
-      const empty = candidateCount === 0 && interrupted.length === 0;
+    const PANEL_UI_SRC = 'c-cleaner/ui/index.html';
 
-      return h(
-        'div',
-        { className: 'ccl-migrate' },
-        h('div', { className: 'ccl-migrate-head' }, `🧷 ${t('migrate.title')}`),
-        h('div', { className: 'ccl-migrate-sub' }, t('migrate.sub', { root: targetRoot ?? '—' })),
-        interrupted.length > 0
-          ? h(
-              'div',
-              { className: 'ccl-migrate-warn' },
-              t('migrate.interrupted', { n: interrupted.length }),
-              interrupted.map((m) =>
-                h(
-                  'div',
-                  { key: `i${m.id}`, className: 'ccl-migrate-row' },
-                  h('span', { className: 'ccl-path', title: m.source_path }, m.source_path),
-                  h('span', { className: 'ccl-migrate-note' }, `${m.state} → ${m.target_path}`),
-                  h(
-                    'button',
-                    { className: 'ccl-btn', disabled: busy, onClick: () => void onUndo(m.source_path) },
-                    t('migrate.undo'),
-                  ),
-                ),
-              ),
-            )
-          : null,
-        empty
-          ? h('div', { className: 'ccl-note' }, t('migrate.none', { min: formatBytes(minBytes) }))
-          : h(
-              'table',
-              { className: 'ccl-table' },
-              h(
-                'tbody',
-                null,
-                candidates.slice(0, 8).map((c) =>
-                  h(
-                    'tr',
-                    { key: c.path, className: 'ccl-row' },
-                    h('td', { className: 'ccl-path', title: c.path }, c.path),
-                    h('td', { className: 'ccl-num', style: { width: '90px' } }, formatBytes(c.bytes)),
-                    h('td', { style: { width: '120px' } }, `${c.files} 个文件`),
-                    h(
-                      'td',
-                      { style: { width: '110px' } },
-                      h(
-                        'button',
-                        { className: 'ccl-btn', disabled: busy, onClick: () => void onMigrate(c.path) },
-                        busy ? t('migrate.running') : t('migrate.button'),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        // Links that are already in place: the only useful action is the undo.
-        history.some((m) => m.state === 'LINKED')
-          ? h(
-              'div',
-              { className: 'ccl-migrate-links' },
-              history
-                .filter((m) => m.state === 'LINKED')
-                .slice(0, 5)
-                .map((m) =>
-                  h(
-                    'div',
-                    { key: `l${m.id}`, className: 'ccl-migrate-row' },
-                    h('span', { className: 'ccl-migrate-ok' }, '✅'),
-                    h('span', { className: 'ccl-path', title: m.source_path }, m.source_path),
-                    h('span', { className: 'ccl-migrate-note' }, `→ ${m.target_path}`),
-                    h(
-                      'button',
-                      { className: 'ccl-btn', disabled: busy, onClick: () => void onUndo(m.source_path) },
-                      t('migrate.undo'),
-                    ),
-                  ),
-                ),
-            )
-          : null,
-        h('div', { className: 'ccl-migrate-hint' }, t('migrate.hint')),
-      );
-    }
+    /*
+     * The height the document was designed for. `.app-shell` is 1120x740 and `body` adds 16px of
+     * padding, so anything below ~772px would clip the dock. When the host gives the panel less
+     * room the wrapper scrolls rather than squashing the layout; when it gives more, the frame
+     * grows to fill it.
+     */
+    const PANEL_UI_MIN_HEIGHT = 772;
 
     function Panel(props) {
       const { t } = props;
-      const [snapshot, setSnapshot] = useState(null);
-      const [error, setError] = useState(null);
-      const [selected, setSelected] = useState(() => new Set());
-      const [busy, setBusy] = useState(false);
-      const [result, setResult] = useState(null);
-      const [force, setForce] = useState(false);
-      const [purged, setPurged] = useState(null);
-      /** PRD 3.4: the last migration outcome, and whether one is in flight. */
-      const [migration, setMigration] = useState(null);
-      const alive = useRef(true);
-      const rootRef = useRef(null);
-
-      const load = useCallback(async (verb) => {
-        const res = verb === 'refresh' ? await apiFetch('refresh', { method: 'POST' }) : await apiFetch('state');
-        if (!alive.current) return;
-        if (res.ok) {
-          setSnapshot(res.value);
-          setError(null);
-          // Keep only selections that still exist, so a clean run cannot act on a
-          // path the plugin has since forgotten.
-          setSelected((prev) => {
-            if (prev.size === 0) return prev;
-            const live = new Set((res.value.rows ?? []).map((r) => r.file_path));
-            const next = new Set([...prev].filter((p) => live.has(p)));
-            return next.size === prev.size ? prev : next;
-          });
-        } else {
-          setError(res.error);
-        }
-      }, []);
-
-      useEffect(() => {
-        alive.current = true;
-        void load('state');
-        return () => {
-          alive.current = false;
-        };
-      }, [load]);
-
-      const rows = snapshot?.rows ?? [];
-      const byTier = { SAFE_TO_DELETE: [], CAUTION_CACHE: [], LOCKED_CRITICAL: [] };
-      for (const row of rows) {
-        (byTier[row.category] ?? byTier.SAFE_TO_DELETE).push(row);
-      }
-      for (const list of Object.values(byTier)) {
-        list.sort((a, b) => (Number(b.file_size) || 0) - (Number(a.file_size) || 0));
-      }
-
-      const totals = {};
-      for (const category of CATEGORY_ORDER) {
-        totals[category] = {
-          count: byTier[category].length,
-          bytes: byTier[category].reduce((sum, r) => sum + (Number(r.file_size) || 0), 0),
-        };
-      }
-
-      const toggle = useCallback((path) => {
-        setSelected((prev) => {
-          const next = new Set(prev);
-          if (next.has(path)) next.delete(path);
-          else next.add(path);
-          return next;
-        });
-      }, []);
-
-      const selectAllSafe = useCallback(() => {
-        setSelected(new Set(byTier.SAFE_TO_DELETE.map((r) => r.file_path)));
-      }, [rows]);
-
-      /**
-       * Drop tracking rows the PRD 3.2 gate would reject today. These are rows recorded
-       * before the filter existed, so the table is dominated by other software's Temp
-       * churn (measured live: 1079 of 2205 green rows, ~1.09 GB). They are not dangerous
-       * to delete — they are unlocked files in %TEMP% — but they bury the dsh-authored
-       * rows the PRD actually asks this panel to show, and 全选可清理项 / 清理全部可清理
-       * would act on all of them. This only forgets rows; no file on disk is touched.
-       */
-      const runPurge = useCallback(async () => {
-        if (busy) return;
-        setBusy(true);
-        setResult(null);
-        const res = await apiFetch('purge', { method: 'POST' });
-        if (!alive.current) return;
-        setBusy(false);
-        if (res.ok) {
-          setSelected(new Set());
-          if (res.value.rows) setSnapshot((prev) => ({ ...(prev ?? {}), rows: res.value.rows }));
-          else void load('state');
-          setPurged(res.value.forgotten ?? 0);
-        } else {
-          setError(res.error);
-        }
-      }, [busy, load]);
-
-      const runClean = useCallback(
-        async (paths, deep) => {
-          if (busy || paths.length === 0) return;
-          setBusy(true);
-          setResult(null);
-          const res = await apiFetch('clean', {
-            method: 'POST',
-            body: JSON.stringify({ paths, deep: deep === true, force }),
-          });
-          if (!alive.current) return;
-          setBusy(false);
-          if (res.ok) {
-            const report = res.value.report ?? {};
-            setResult({
-              removed: report.removed ?? 0,
-              bytesFreed: report.bytesFreed ?? 0,
-              skipped: report.skipped ?? 0,
-              rejected: (res.value.rejected ?? []).length,
-              errors: (report.errors ?? []).length,
-            });
-            setSelected(new Set());
-            if (res.value.rows) setSnapshot((prev) => ({ ...(prev ?? {}), rows: res.value.rows }));
-            else void load('state');
-          } else {
-            setError(res.error);
-          }
-        },
-        [busy, force, load],
-      );
-
-      /**
-       * PRD 3.4 — the folder behind the current selection.
-       *
-       * The table selects FILES but the operation moves a DIRECTORY, so the folder is derived:
-       * every selected path contributes its immediate parent, and a selection spanning more
-       * than one folder has no single answer. Returning null there (instead of silently
-       * migrating the first folder) keeps `[M]` from moving something the user did not point at.
-       */
-      const selectedDir = useCallback(() => {
-        const dirs = new Map();
-        for (const p of selected) {
-          const cut = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
-          if (cut > 0) dirs.set(p.slice(0, cut).toLowerCase(), p.slice(0, cut));
-        }
-        return dirs.size === 1 ? [...dirs.values()][0] : null;
-      }, [selected]);
-
-      /** POST one migration. The server re-derives the candidate list, so a refusal is normal. */
-      const runMigrate = useCallback(
-        async (dirPath) => {
-          if (busy || !dirPath) return;
-          setBusy(true);
-          setMigration(null);
-          const res = await apiFetch('migrate', {
-            method: 'POST',
-            body: JSON.stringify({ path: dirPath }),
-          });
-          if (!alive.current) return;
-          setBusy(false);
-          if (!res.ok) {
-            setError(res.error);
-            return;
-          }
-          const outcome = res.value.result ?? {};
-          setMigration({ ok: outcome.ok === true, path: outcome.source ?? dirPath, target: outcome.target, code: outcome.code, reason: outcome.reason, bytes: outcome.bytes });
-          if (res.value.rows) setSnapshot((prev) => ({ ...(prev ?? {}), rows: res.value.rows, migrations: res.value.migrations ?? prev?.migrations }));
-          else void load('state');
-          if (outcome.ok === true) setSelected(new Set());
-        },
-        [busy, load],
-      );
-
-      /** POST one undo. Only the server's own migration record can be reversed. */
-      const runUnmigrate = useCallback(
-        async (dirPath) => {
-          if (busy || !dirPath) return;
-          setBusy(true);
-          setMigration(null);
-          const res = await apiFetch('unmigrate', {
-            method: 'POST',
-            body: JSON.stringify({ path: dirPath }),
-          });
-          if (!alive.current) return;
-          setBusy(false);
-          if (!res.ok) {
-            setError(res.error);
-            return;
-          }
-          const outcome = res.value.result ?? {};
-          setMigration({ ok: outcome.ok === true, path: outcome.source ?? dirPath, target: outcome.target, code: outcome.code, reason: outcome.reason, undone: true });
-          if (res.value.rows) setSnapshot((prev) => ({ ...(prev ?? {}), rows: res.value.rows, migrations: res.value.migrations ?? prev?.migrations }));
-          else void load('state');
-        },
-        [busy, load],
-      );
-
-      const migrations = snapshot?.migrations ?? null;
-      const migrateCandidates = Array.isArray(migrations?.candidates) ? migrations.candidates : [];
-      const migrateTargetRoot = migrations?.targetRoot ?? null;
-
-      // Keys are scoped to the panel root, so they never fight the composer or the
-      // shell's own shortcuts unless the panel is genuinely the focused surface.
-      const onKeyDown = useCallback(
-        (event) => {
-          if (event.target instanceof HTMLInputElement && event.key !== 'Enter') return;
-          if (event.key === 'Enter') {
-            event.preventDefault();
-            void runClean([...selected], false);
-          } else if (event.key === 'r' || event.key === 'R') {
-            event.preventDefault();
-            void load('refresh');
-          } else if (event.key === 'm' || event.key === 'M') {
-            // PRD §4 hotkey bar: [M] migrates the SELECTED directory to E: via mklink /J.
-            event.preventDefault();
-            void runMigrate(selectedDir());
-          } else if (event.key === ' ') {
-            event.preventDefault();
-            const first = byTier.SAFE_TO_DELETE[0] ?? byTier.CAUTION_CACHE[0];
-            if (first) toggle(first.file_path);
-          }
-        },
-        [selected, runClean, load, byTier, toggle],
-      );
-
-      const hijack = snapshot?.hijack ?? null;
-      const hijackOk = hijack?.installed === true;
-      const entries = Array.isArray(hijack?.entries) ? hijack.entries : [];
-      const okCount = entries.filter((e) => e.ok).length;
-
+      const src = hostRouteUrl(PANEL_UI_SRC).href;
       return h(
         'div',
-        { className: 'ccl-root', ref: rootRef, tabIndex: -1, onKeyDown },
-        h('style', null, CSS),
-        h(
-          'div',
-          { className: 'ccl-head' },
-          h('h1', { className: 'ccl-title' }, t('panel.title')),
-          h('p', { className: 'ccl-sub' }, t('panel.subtitle')),
-          h(
-            'div',
-            { className: 'ccl-status' },
-            h(
-              'span',
-              { className: `ccl-pill ${hijackOk ? 'ccl-pill-ok' : 'ccl-pill-err'}` },
-              hijackOk ? '✅' : '⚠️',
-              hijackOk ? t('hijack.active') : t('hijack.inactive'),
-              entries.length > 0 ? ` · ${t('hijack.vars', { n: okCount })}` : '',
-            ),
-            snapshot?.escapeRoot
-              ? h(
-                  'span',
-                  { className: 'ccl-pill' },
-                  `${t('hijack.escapeRoot')}: `,
-                  h('span', { className: 'ccl-mono' }, snapshot.escapeRoot),
-                )
-              : null,
-            snapshot?.escapeWritable === false
-              ? h('span', { className: 'ccl-pill ccl-pill-err' }, t('hijack.unwritable'))
-              : null,
-          ),
-        ),
-        h(
-          'div',
-          { className: 'ccl-summary' },
-          ...CATEGORY_ORDER.map((category) =>
-            h(
-              'div',
-              { key: category, className: 'ccl-stat' },
-              h('span', {
-                className: `ccl-dot ccl-dot-${category === 'SAFE_TO_DELETE' ? 'safe' : category === 'CAUTION_CACHE' ? 'caution' : 'locked'}`,
-              }),
-              h('span', { className: 'ccl-stat-label' }, t(TIER_KEY[category])),
-              h(
-                'span',
-                { className: 'ccl-stat-value' },
-                `${formatBytes(totals[category].bytes)} (${totals[category].count})`,
-              ),
-            ),
-          ),
-        ),
-        h(
-          'div',
-          { className: 'ccl-bar' },
-          h(
-            'button',
-            { className: 'ccl-btn ccl-btn-primary', disabled: busy || selected.size === 0, onClick: () => void runClean([...selected], false) },
-            t('action.cleanSelected'),
-            selected.size > 0 ? ` (${selected.size})` : '',
-          ),
-          h(
-            'button',
-            { className: 'ccl-btn', disabled: busy || byTier.SAFE_TO_DELETE.length === 0, onClick: () => void runClean(byTier.SAFE_TO_DELETE.map((r) => r.file_path), false) },
-            t('action.cleanSafe'),
-          ),
-          h('button', { className: 'ccl-btn', onClick: selectAllSafe }, t('action.selectSafe')),
-          h('button', { className: 'ccl-btn', disabled: busy, onClick: () => void load('refresh') }, t('action.refresh')),
-          h(
-            'button',
-            { className: 'ccl-btn', disabled: busy, title: t('purge.hint'), onClick: () => void runPurge() },
-            t('action.purge'),
-          ),
-          h(
-            'button',
-            {
-              className: 'ccl-btn',
-              // PRD §4 hotkey bar: [M] 将选中目录软链接迁移至E盘. Disabled unless the whole
-              // selection sits in ONE folder — see `selectedDir()`.
-              disabled: busy || selectedDir() === null,
-              title: t('migrate.hint'),
-              onClick: () => void runMigrate(selectedDir()),
-            },
-            `[M] ${t('migrate.button')}`,
-          ),
-          h('div', { className: 'ccl-spacer' }),
-          h(
-            'label',
-            { className: 'ccl-check', title: t('action.deleteForever') },
-            h('input', { type: 'checkbox', checked: force, onChange: () => setForce((v) => !v) }),
-            t('action.deleteForever'),
-          ),
-        ),
-        h(
-          'div',
-          { className: 'ccl-body' },
-          error
-            ? h('div', { className: 'ccl-note', style: { color: 'var(--dsw-alias-state-error-primary)' } }, `${t('error.prefix')} ${error}`)
-            : null,
-          snapshot === null
-            ? h('div', { className: 'ccl-note' }, t('loading'))
-            : h(
-                'div',
-                null,
-                h(MigrateSection, {
-                  migrations,
-                  candidateCount: migrateCandidates.length,
-                  targetRoot: migrateTargetRoot,
-                  busy,
-                  migration,
-                  onMigrate: runMigrate,
-                  onUndo: runUnmigrate,
-                  minBytes: 10 * 1024 * 1024,
-                  t,
-                }),
-                rows.length === 0
-                  ? h('div', { className: 'ccl-note' }, t('table.empty'))
-                  : CATEGORY_ORDER.map((category) =>
-                      h(TierGroup, {
-                        key: category,
-                        category,
-                        rows: byTier[category],
-                        selected,
-                        onToggle: toggle,
-                        t,
-                      }),
-                    ),
-              ),
-        ),
-        h(
-          'div',
-          { className: 'ccl-foot' },
-          h('span', null, t('hint.keys')),
-          h('span', null, snapshot?.useRecycleBin === false ? t('hint.physical') : t('hint.recycle')),
-          purged !== null
-            ? h('span', { className: 'ccl-result' }, t('result.purged', { n: purged }))
-            : null,
-          result
-            ? h(
-                'span',
-                {
-                  className: 'ccl-result',
-                  /* A run that removed NOTHING must say so loudly. It used to render an empty
-                   * string (every part was gated on `> 0`), so a click on a 99 %-stale table
-                   * looked like a dead button. */
-                  style: result.removed === 0 ? { color: 'var(--dsw-alias-state-error-primary)' } : null,
-                },
-                result.removed > 0 || result.skipped > 0 || result.rejected > 0
-                  ? [
-                      result.removed > 0 ? t('result.removed', { n: result.removed, size: formatBytes(result.bytesFreed) }) : null,
-                      result.skipped > 0 ? t('result.skipped', { n: result.skipped }) : null,
-                      result.rejected > 0 ? t('result.rejected', { n: result.rejected }) : null,
-                    ]
-                      .filter(Boolean)
-                      .join(' ')
-                  : t('result.none'),
-              )
-            : null,
-          migration
-            ? h(
-                'span',
-                { className: 'ccl-result', style: migration.ok ? null : { color: 'var(--dsw-alias-state-error-primary)' } },
-                migration.ok
-                  ? migration.undone
-                    ? t('migrate.undone', { path: migration.path })
-                    : t('migrate.ok', { path: migration.path, target: migration.target ?? '—', size: formatBytes(migration.bytes ?? 0) })
-                  : t('migrate.refused', { code: migration.code ?? 'UNKNOWN', reason: migration.reason ?? '' }),
-              )
-            : null,
-        ),
+        {
+          className: 'ccl-frame-wrap',
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            height: '100%',
+            minHeight: '0',
+            overflow: 'auto',
+          },
+        },
+        h('iframe', {
+          className: 'ccl-frame',
+          src,
+          title: t('panel.title'),
+          /* No `sandbox` attribute on purpose: the document must reach this plugin's route, and
+           * `allow-scripts` + `allow-same-origin` together would grant it nothing it does not
+           * already have at the same origin. */
+          style: {
+            display: 'block',
+            flex: '1 1 auto',
+            width: '100%',
+            minHeight: PANEL_UI_MIN_HEIGHT + 'px',
+            border: '0',
+            background: 'transparent',
+            colorScheme: 'dark',
+          },
+        }),
       );
     }
-
     return {
       inject: ['slots'],
       apply(ctx) {

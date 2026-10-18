@@ -26,6 +26,7 @@ import { LockOwnerResolver } from './lib/lock-owner.js';
 import { StateDB } from './lib/state-db.js';
 import { registerCommands } from './lib/commands.js';
 import { registerWebApi, findDeadRows } from './lib/web-api.js';
+import { registerPanelUi } from './lib/panel-ui.js';
 import { recoverClientGraph } from './lib/client-graph.js';
 import { targetRootOf } from './lib/symlink-migrate.js';
 import { installSessionHook } from './lib/session-hook.js';
@@ -237,6 +238,34 @@ export function apply(ctx, config = {}) {
   });
   let watcher = null;
 
+  /**
+   * Ring buffer of classified candidates, for the glass panel's live push channel.
+   *
+   * The panel polls `poll_events(after, limit)` and slides each new row in with the `⚡ 实时捕获`
+   * animation. A bounded buffer (not an unbounded log) is deliberate: the panel only ever asks
+   * for events NEWER than its last cursor, and a long-idle session must not grow this without
+   * limit. Cursor values are monotonic and survive a page refresh, so `primeLiveCursor()` can ask
+   * for the current cursor without replaying a backlog the panel has already rendered.
+   */
+  const liveBuffer = [];
+  const LIVE_BUFFER_MAX = 500;
+  let liveSeq = 0;
+  const pushLive = (record) => {
+    liveSeq += 1;
+    liveBuffer.push({ seq: liveSeq, record });
+    while (liveBuffer.length > LIVE_BUFFER_MAX) liveBuffer.shift();
+  };
+  /**
+   * @param {number} after - return events with `seq > after`; `0` returns the whole buffer.
+   * @param {number} limit - max events; `0` returns none (used only to read the cursor).
+   */
+  const liveEvents = (after, limit) => {
+    const cursor = liveSeq;
+    if (!Number.isFinite(limit) || limit <= 0) return { cursor, events: [] };
+    const events = liveBuffer.filter((e) => e.seq > after).slice(0, limit);
+    return { cursor, events };
+  };
+
   // --- PRD 3.3: who holds a locked file -------------------------------------
   // `classify` is synchronous and cannot wait ~140 ms (plus a PowerShell start) for an answer, so
   // the owner is resolved AFTER the row is persisted and patched back in. Batched and cached by
@@ -277,6 +306,9 @@ export function apply(ctx, config = {}) {
       db?.upsert(record);
       log.debug(`candidate ${record.category}: ${record.path} (${record.size} B)`);
       if (record.category === 'LOCKED_CRITICAL') enrichOwner(record);
+      // Feed the glass panel's live channel before any auto-clean can remove the file: the panel
+      // must show the row that was captured even if `autoClean` deletes it a moment later.
+      pushLive(record);
       if (cfg.autoClean && record.category === 'SAFE_TO_DELETE') {
         // Phase 3 hook — only reachable when `autoClean: true` is set explicitly.
         void import('./lib/cleaner.js')
@@ -496,6 +528,81 @@ export function apply(ctx, config = {}) {
     log.warn(`panel api wiring failed (no scoped inject): ${err?.message || String(err)}`);
   }
 
+  // --- the glass panel document + its REST dialect ---------------------------
+  // A SECOND prefix route (`/c-cleaner/ui`) serves `ui/index.html` and adapts the panel's flat
+  // dialect onto this plugin's `{ok, value}` API. `webServer.match()` is longest-prefix-wins and
+  // `/c-cleaner/ui/api/...` does not start with `/c-cleaner/api/`, so the two prefixes coexist.
+  // Same scoped-inject and same generation-claim discipline as the API route above.
+  const PANEL_UI_ROUTE = Symbol.for('@local/dsh-c-cleaner.panel-ui-route');
+  const panelUiStamp = (globalThis[PANEL_UI_ROUTE]?.stamp ?? 0) + 1;
+  const panelUiDeps = {
+    cfg,
+    log,
+    db,
+    trackedRows,
+    refresh: async () => {
+      await tree.refresh();
+    },
+    forgetRows: webApiDeps.forgetRows,
+    clean: webApiDeps.clean,
+    migrate: webApiDeps.migrate,
+    /* The old panel could reverse a migration ("撤销迁移"); the glass panel replaced it, so the
+       capability has to come with it or the swap silently removes a feature. */
+    undoMigration: webApiDeps.undoMigration,
+    migrationRecordFor: webApiDeps.migrationRecordFor,
+    escapeWritable: webApiDeps.escapeWritable,
+    hostPid: process.pid,
+    watcherStats: () => {
+      try {
+        return watcher ? watcher.stats() : null;
+      } catch (err) {
+        log.debug(`watcher stats unavailable: ${err?.message || String(err)}`);
+        return null;
+      }
+    },
+    liveEvents,
+  };
+  let panelUiClaim = null;
+  const releaseStalePanelRoute = () => {
+    const stale = globalThis[PANEL_UI_ROUTE];
+    if (stale && typeof stale.dispose === 'function') {
+      try {
+        stale.dispose();
+      } catch {
+        /* a predecessor's route disposer failing must not block ours */
+      }
+    }
+    globalThis[PANEL_UI_ROUTE] = null;
+  };
+  try {
+    if (typeof ctx.inject !== 'function') throw new TypeError('ctx.inject is not available');
+    ctx.inject(['webServer'], (webCtx) => {
+      const claim = { stamp: panelUiStamp, dispose: null };
+      panelUiClaim = claim;
+      try {
+        releaseStalePanelRoute();
+        claim.dispose = registerPanelUi(webCtx, panelUiDeps);
+        globalThis[PANEL_UI_ROUTE] = claim;
+        log.info('glass panel registered at /c-cleaner/ui/index.html');
+      } catch (err) {
+        log.warn(`glass panel registration failed: ${err?.message || String(err)}`);
+      }
+      webCtx.effect(() => () => {
+        if (globalThis[PANEL_UI_ROUTE] === claim) {
+          try {
+            claim.dispose?.();
+          } catch {
+            /* the route disposer is already gone with the child fiber */
+          }
+          globalThis[PANEL_UI_ROUTE] = null;
+        }
+        panelUiClaim = null;
+      }, 'dsh-c-cleaner: glass panel route');
+    });
+  } catch (err) {
+    log.warn(`glass panel wiring failed (no scoped inject): ${err?.message || String(err)}`);
+  }
+
   // --- PRD 7 Phase 2: make the Client half reachable without a restart -------
   // `dsh-client-modules` caches the parsed `dsh.client` verdict for a loader row forever and
   // never invalidates it, so a plugin that was installed BEFORE it grew a Client half stays out
@@ -539,6 +646,17 @@ export function apply(ctx, config = {}) {
       webApiClaim = null;
     } catch (err) {
       log.warn(`panel api dispose failed: ${err?.message}`);
+    }
+    try {
+      // Same ownership check as the API route: `register`'s disposer deletes by PATH, so a late
+      // teardown must not delete the panel route a newer generation installed.
+      if (globalThis[PANEL_UI_ROUTE] === panelUiClaim) {
+        panelUiClaim?.dispose?.();
+        globalThis[PANEL_UI_ROUTE] = null;
+      }
+      panelUiClaim = null;
+    } catch (err) {
+      log.warn(`glass panel dispose failed: ${err?.message}`);
     }
     try {
       sessionHook?.dispose();
