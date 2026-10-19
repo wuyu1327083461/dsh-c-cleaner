@@ -577,6 +577,23 @@ node test/adversarial-p2-handle.mjs   # spawns real psutil sweeps: >120 s
 Installed via `plugin_manager { action: "install_bundle", target: "F:\\work\\dsh-c-cleaner" }`
 → `{"changed":true,"application":"applied","warnings":[]}`.
 
+Re-installed through the `dsh plugin` CLI after the 0.5.0 manifest fix, in a scratch profile as
+well as in this host's live `tauri` profile:
+
+```
+$ node <DSH_BIN> plugin --profile <p> add F:/work/dsh-c-cleaner
+dependencies:
++ dsh-c-cleaner link:F:/work/dsh-c-cleaner
+Done in 347ms using pnpm v11.7.0
+# profile package.json afterwards:
+#   "dependencies": { "dsh-c-cleaner": "link:F:/work/dsh-c-cleaner" }
+#   "dsh.profile.bundles": ["dsh-c-cleaner"]        <-- registered by reconcile()
+```
+
+`dsh --profile tauri --dump-config` then composes the overlay as `# == dsh-c-cleaner` /
+`id: dsh-c-cleaner` / `name: dsh-c-cleaner`, and
+`evaluatePluginCompatibility(manifest)` reports no issue against runtime `0.2.1-rc.2`.
+
 **(a) The hijack reaches real children.** A plain harness `bash` call after installation:
 
 ```
