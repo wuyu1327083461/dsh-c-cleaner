@@ -61,7 +61,7 @@ cd F:/work && dsh plugin --profile <profile> add ./dsh-c-cleaner
 dsh plugin --profile <profile> add dsh-c-cleaner
 ```
 
-> 这一条只在包发布到 npm 之后可用。发布前请改用下面的 GitHub、tarball 或本地路径形式 —— 否则 pnpm 会以 `[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/dsh-c-cleaner: Not Found` 失败。
+> 已发布：`dsh-c-cleaner@0.5.0`，见 <https://www.npmjs.com/package/dsh-c-cleaner>。装出来的是 `^0.5.0` 的 registry 依赖，pnpm 会把它拷进 profile 的 `node_modules`（不是软链），所以之后要升级得重新 `add` 一次。
 
 ### 从 GitHub 安装
 
@@ -533,7 +533,7 @@ Both forms install a **link** dependency, so later edits in the checkout are vis
 dsh plugin --profile <profile> add dsh-c-cleaner
 ```
 
-> This form only works once the package is published to npm. Until then use GitHub, the tarball, or a local path below — otherwise pnpm fails with `[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/dsh-c-cleaner: Not Found`.
+> Published: `dsh-c-cleaner@0.5.0`, see <https://www.npmjs.com/package/dsh-c-cleaner>. This installs a `^0.5.0` registry dependency that pnpm copies into the profile's `node_modules` (not a symlink), so re-run `add` to upgrade later.
 
 ### From GitHub
 
