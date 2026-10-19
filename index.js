@@ -115,7 +115,7 @@ function rowsToClassified(rows) {
  * whatever previous generation is still registered. When HMR disposes correctly the slot is
  * already empty and this is a no-op, so it is a safety net and not a second teardown path.
  */
-const ACTIVE_GENERATION = Symbol.for('@local/dsh-c-cleaner.active-generation');
+const ACTIVE_GENERATION = Symbol.for('dsh-c-cleaner.active-generation');
 
 /**
  * Cordis plugin entry point.
@@ -471,7 +471,7 @@ export function apply(ctx, config = {}) {
   // `register` throws, gets swallowed by the catch below, and the panel is served by the OLD
   // generation's handler — the route would look "registered" while running stale code. Disposing
   // any predecessor route first makes registration deterministic.
-  const WEB_API_ROUTE = Symbol.for('@local/dsh-c-cleaner.web-api-route');
+  const WEB_API_ROUTE = Symbol.for('dsh-c-cleaner.web-api-route');
   /** Monotonic stamp so a superseded generation can tell it no longer owns the route. */
   const routeStamp = (globalThis[WEB_API_ROUTE]?.stamp ?? 0) + 1;
   /**
@@ -533,7 +533,7 @@ export function apply(ctx, config = {}) {
   // dialect onto this plugin's `{ok, value}` API. `webServer.match()` is longest-prefix-wins and
   // `/c-cleaner/ui/api/...` does not start with `/c-cleaner/api/`, so the two prefixes coexist.
   // Same scoped-inject and same generation-claim discipline as the API route above.
-  const PANEL_UI_ROUTE = Symbol.for('@local/dsh-c-cleaner.panel-ui-route');
+  const PANEL_UI_ROUTE = Symbol.for('dsh-c-cleaner.panel-ui-route');
   const panelUiStamp = (globalThis[PANEL_UI_ROUTE]?.stamp ?? 0) + 1;
   const panelUiDeps = {
     cfg,

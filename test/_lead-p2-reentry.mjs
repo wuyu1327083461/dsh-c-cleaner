@@ -138,7 +138,7 @@ try {
   // `stopAllWatchers()`. The raw registry is what makes it reachable. Simulate that leak by
   // creating a raw `fs.watch` (the plugin's exact options) and registering it BY HAND, as a
   // pre-registry generation could not have registered itself; then let apply() reap it.
-  const RAW_REG = Symbol.for('@local/dsh-c-cleaner.raw-watchers');
+  const RAW_REG = Symbol.for('dsh-c-cleaner.raw-watchers');
   let phantomDelivered = 0;
   const phantom = fs.watch(dir, { recursive: false, persistent: false }, () => {
     phantomDelivered += 1;

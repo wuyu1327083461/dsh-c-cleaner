@@ -345,7 +345,7 @@ await check('a first generation registered the route', () => {
 // reaching the ownership check. The probe then passed even with that ownership check MUTATED —
 // it was testing the idempotency latch, not the guard. Nulling the slot is what makes the guard
 // reachable, and a mutation test proves it.
-globalThis[Symbol.for('@local/dsh-c-cleaner.active-generation')] = null;
+globalThis[Symbol.for('dsh-c-cleaner.active-generation')] = null;
 
 const second = makeCtx(sharedTable);
 second.provideWebServer();

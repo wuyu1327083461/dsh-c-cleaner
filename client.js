@@ -19,7 +19,7 @@
  * Kept free of side effects at factory time: every registration happens inside `apply`.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-c-cleaner',
+  id: 'dsh-c-cleaner',
   factory(require) {
     const React = require('react');
     const h = React.createElement;

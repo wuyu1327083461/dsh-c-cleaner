@@ -5,7 +5,7 @@
 // `process.getActiveResourcesInfo()`, so a watcher leaked by a module generation that
 // predates the instance registry can never be found by scanning — yet it keeps
 // delivering. The cure under test is the process-global RAW registry
-// (`Symbol.for('@local/dsh-c-cleaner.raw-watchers')`), which stores the raw
+// (`Symbol.for('dsh-c-cleaner.raw-watchers')`), which stores the raw
 // `fs.FSWatcher` objects so ANY later generation can close them directly.
 //
 // The probe deliberately does NOT use CWatcher for the "leaked" watcher: it creates a
@@ -18,7 +18,7 @@ import path from 'node:path';
 import { closeAllRawWatchers, rawWatcherCount } from '../lib/watcher.js';
 
 const REAL_TEMP = 'C:\\Users\\kiuhg\\AppData\\Local\\Temp';
-const RAW_REG = Symbol.for('@local/dsh-c-cleaner.raw-watchers');
+const RAW_REG = Symbol.for('dsh-c-cleaner.raw-watchers');
 
 const checks = [];
 function check(name, ok, detail) {

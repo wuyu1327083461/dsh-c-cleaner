@@ -101,7 +101,7 @@ new Function('window', 'console', SRC)(globalThis.window, console);
 // --- module shape ---------------------------------------------------------------
 check('client.js calls __ModuleLoader__.load with the package name as id', () => {
   assert.ok(captured, 'load() was never called');
-  assert.equal(captured.id, '@local/dsh-c-cleaner');
+  assert.equal(captured.id, 'dsh-c-cleaner');
   assert.equal(typeof captured.factory, 'function');
 });
 

@@ -31,15 +31,66 @@ terminal TUI, because a Cordis slash command cannot render an interactive compon
 
 ## Install
 
-From a workspace checkout, install the bundle by pointing `plugin_manager` at this directory:
+`dsh plugin` is the official entry point: it is a pnpm front end that runs inside the profile
+directory and, after a successful install, rewrites `dsh.profile.bundles` for every new dependency
+that declares `dsh.bundle`. This package declares one (`./cordis.patch.yml`), so it becomes a live
+profile layer automatically — never hand-edit the profile's `package.json` or `cordis.patch.yml`,
+and never create packages under `$DSH_HOME`.
+
+### From a workspace checkout (absolute path)
+
+```sh
+dsh plugin --profile <profile> add <abs path to this directory>
+# e.g. dsh plugin --profile tauri add F:/work/dsh-c-cleaner
+```
+
+A relative directory works too, interpreted from the current working directory:
+
+```sh
+cd F:/work && dsh plugin --profile <profile> add ./dsh-c-cleaner
+```
+
+Both forms install a **link** dependency, so later edits in the checkout are visible on disk.
+
+### From npm (by name)
+
+```sh
+dsh plugin --profile <profile> add dsh-c-cleaner
+```
+
+### From GitHub
+
+```sh
+dsh plugin --profile <profile> add github:wuyu1327083461/dsh-c-cleaner
+```
+
+### From a packed tarball
+
+```sh
+dsh plugin --profile <profile> add file:<abs path to dsh-c-cleaner-0.5.0.tgz>
+```
+
+Use a Windows-style path (`file:C:/...`), not an MSYS path (`file:/c/...`) — pnpm does not accept
+the latter.
+
+### Through the `plugin_manager` tool
+
+The same install, driven from an agent session rather than a shell:
 
 ```
 plugin_manager { action: "install_bundle", target: "<abs path to this directory>" }
 ```
 
-Do not hand-edit the profile's `package.json` or `cordis.patch.yml`, and do not create packages
-under `$DSH_HOME`. Replacing an already-installed copy of this package requires a harness
-**restart** to load a fresh JS module generation; a first-time install can activate via HMR.
+Replacing an already-installed copy of this package requires a harness **restart** to load a fresh
+JS module generation; a first-time install can activate via HMR.
+
+### What `files` must contain
+
+pnpm packs a git or tarball dependency according to the `files` array, so `cordis.patch.yml` **must**
+be listed there. If it is missing, the installed tree has no patch file and the install is rejected
+with `dsh: installation rejected: ... failed to read overlay ... cordis.patch.yml: ENOENT` and then
+rolled back. Path and `link:` installs bypass packing and are unaffected, which is why the omission
+can hide for a long time.
 
 ## Usage
 
@@ -268,7 +319,7 @@ Every field is optional; all have defaults. Set them in the bundle row's `config
 ```yaml
 - insert:
     - id: dsh-c-cleaner
-      name: '@local/dsh-c-cleaner'
+      name: 'dsh-c-cleaner'
       config:
         debounceMs: 3000
         useRecycleBin: true
@@ -434,11 +485,11 @@ Stated plainly, because each one bounds what this plugin can promise:
     superseded generation before the new one starts. Measured on this host with module-init/`start()`
     markers: `START live=1 … START live=2` with **zero paired `STOP`**, i.e. two watcher generations
     coexisted, and the older one kept writing rows under the *old* gate rules. Three guards now make
-    `apply()` re-entrant-safe: a process-global `Symbol.for('@local/dsh-c-cleaner.active-generation')`
+    `apply()` re-entrant-safe: a process-global `Symbol.for('dsh-c-cleaner.active-generation')`
     slot holding the previous disposer (a module-scope binding cannot work, because HMR re-imports the
     module body and each generation gets a fresh empty variable); a
-    `Symbol.for('@local/dsh-c-cleaner.live-watchers')` registry of live `CWatcher`s that a new
-    generation force-stops; and a `Symbol.for('@local/dsh-c-cleaner.raw-watchers')` registry of the
+    `Symbol.for('dsh-c-cleaner.live-watchers')` registry of live `CWatcher`s that a new
+    generation force-stops; and a `Symbol.for('dsh-c-cleaner.raw-watchers')` registry of the
     **raw `fs.FSWatcher` handles**, which a new generation closes directly. The raw registry is the
     one that actually cures the leak: `_getActiveHandles()` returns `[]` and
     `getActiveResourcesInfo()` names no `FSEventWrap` for the plugin's own watch options
@@ -457,7 +508,7 @@ Stated plainly, because each one bounds what this plugin can promise:
     `webServer.register` threw `webserver: duplicate prefix route "/c-cleaner/api"`, the throw was
     swallowed, and every request kept reaching the **dead** generation's handler whose captured
     `StateDB` had already been closed by its own teardown. Two guards fix it. (a) The route disposer
-    is parked in a process-global `Symbol.for('@local/dsh-c-cleaner.web-api-route')` claim slot, and
+    is parked in a process-global `Symbol.for('dsh-c-cleaner.web-api-route')` claim slot, and
     every dispose is **ownership-checked** — `register` returns `() => table.delete(route.path)`,
     which deletes by **path, not identity**, so an unconditional dispose in a superseded generation's
     teardown would delete the *new* generation's route and re-create the 404. (b) `registerWebApi`
@@ -584,7 +635,7 @@ are meant to be *observed* must be created under the real C: `%TEMP%`.
 ### Editing the plugin while the harness is running
 
 The installed package is a **symlink** to this working directory
-(`$DSH_PROFILE_DIR/node_modules/@local/dsh-c-cleaner -> F:/work/dsh-c-cleaner`), so an edit is
+(`$DSH_PROFILE_DIR/node_modules/dsh-c-cleaner -> F:/work/dsh-c-cleaner`), so an edit is
 immediately visible on disk — but the running harness keeps the module generation it already
 imported. Verified on this host, not assumed: with a file held under a real `FileShare.None` handle
 (positive control: `openSync(p,'r+')` threw `EBUSY`), the live watcher persisted the row as

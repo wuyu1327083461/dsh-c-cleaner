@@ -1,10 +1,32 @@
 {
-  "name": "@local/dsh-c-cleaner",
-  "version": "0.4.1",
-  "private": true,
+  "name": "dsh-c-cleaner",
+  "version": "0.5.0",
   "type": "module",
   "description": "C-drive escape monitor and safe cleaner for DeepSeek Harness",
+  "license": "MIT",
   "icon": "./icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "cache",
+    "cleanup",
+    "windows",
+    "disk-space"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wuyu1327083461/dsh-c-cleaner.git"
+  },
+  "homepage": "https://github.com/wuyu1327083461/dsh-c-cleaner#readme",
+  "bugs": {
+    "url": "https://github.com/wuyu1327083461/dsh-c-cleaner/issues"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -17,7 +39,10 @@
     "lib",
     "ui",
     "locale",
-    "icon.svg"
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {

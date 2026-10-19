@@ -188,12 +188,12 @@ try {
   // Force the lazy registry into existence first (it is created on demand).
   rawWatcherCount();
   // Register it the way a leaked generation would: by hand.
-  globalThis[Symbol.for('@local/dsh-c-cleaner.raw-watchers')].add(held);
+  globalThis[Symbol.for('dsh-c-cleaner.raw-watchers')].add(held);
   const before = rawWatcherCount();
   // Now create a SECOND, "current generation" handle and register it too.
   const mine = fsMod.watch(dir, { recursive: false, persistent: false });
   mine.unref?.();
-  globalThis[Symbol.for('@local/dsh-c-cleaner.raw-watchers')].add(mine);
+  globalThis[Symbol.for('dsh-c-cleaner.raw-watchers')].add(mine);
   const mid = rawWatcherCount();
   // A sweep closes BOTH — that is by design (apply() runs it before creating its own), but
   // the assertion that matters is that a sweep is DETERMINISTIC and total, so a generation
@@ -268,7 +268,7 @@ try {
   // first, gen-1's `disposed` latch makes its later teardown a no-op, and the stillActive
   // check is never consulted (an earlier version of this probe did exactly that, so mutation
   // M4 SURVIVED — the assertion tested the latch, not the ownership check).
-  globalThis[Symbol.for('@local/dsh-c-cleaner.active-generation')] = null;
+  globalThis[Symbol.for('dsh-c-cleaner.active-generation')] = null;
 
   // generation 2 starts with the slot empty, so it does NOT dispose gen-1: gen-1's cleanup
   // stays UNLATCHED and its watcher is reaped by the raw registry (the phantom cure).

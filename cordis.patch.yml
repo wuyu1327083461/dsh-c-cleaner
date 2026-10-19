@@ -1,4 +1,4 @@
 - insert:
     - id: dsh-c-cleaner
-      name: '@local/dsh-c-cleaner'
+      name: 'dsh-c-cleaner'
       config: {}
